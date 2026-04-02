@@ -24,6 +24,18 @@ internal static class ConsoleUi
 
     public static string Code(string text) => Paint(text, "38;5;252;48;5;236");
 
+    public static string CodeKeyword(string text) => Paint(text, "1;38;5;81;48;5;236");
+
+    public static string CodeType(string text) => Paint(text, "38;5;150;48;5;236");
+
+    public static string CodeString(string text) => Paint(text, "38;5;221;48;5;236");
+
+    public static string CodeNumber(string text) => Paint(text, "38;5;215;48;5;236");
+
+    public static string CodeComment(string text) => Paint(text, "2;38;5;108;48;5;236");
+
+    public static string CodeSymbol(string text) => Paint(text, "38;5;117;48;5;236");
+
     public static string Success(string text) => Paint(text, "38;5;42");
 
     public static string Warning(string text) => Paint(text, "38;5;214");

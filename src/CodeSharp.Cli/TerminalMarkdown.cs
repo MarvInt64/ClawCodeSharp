@@ -114,7 +114,7 @@ internal static partial class TerminalMarkdown
 
         foreach (var line in lines.DefaultIfEmpty(string.Empty))
         {
-            rendered.AddRange(WrapCodeLine(line, maxWidth, "  │ "));
+            rendered.AddRange(WrapCodeLine(line, language, maxWidth, "  │ "));
         }
 
         return rendered;
@@ -267,13 +267,84 @@ internal static partial class TerminalMarkdown
         return rendered;
     }
 
-    private static IReadOnlyList<string> WrapCodeLine(string line, int maxWidth, string prefix)
+    private static IReadOnlyList<string> WrapCodeLine(string line, string language, int maxWidth, string prefix)
     {
         var width = Math.Max(8, maxWidth - prefix.Length);
         return HardWrap(line, width)
-            .Select(part => prefix + ConsoleUi.Code(part))
+            .Select(part => prefix + HighlightCode(language, part))
             .ToList();
     }
+
+    private static string HighlightCode(string language, string text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return ConsoleUi.Code(text);
+        }
+
+        return NormalizeLanguage(language) switch
+        {
+            "csharp" => HighlightByPattern(text, CSharpTokenRegex(), token => token switch
+            {
+                _ when token.StartsWith("//", StringComparison.Ordinal) => ConsoleUi.CodeComment(token),
+                _ when token.StartsWith("\"", StringComparison.Ordinal) || token.StartsWith("@\"", StringComparison.Ordinal) || token.StartsWith("'", StringComparison.Ordinal) => ConsoleUi.CodeString(token),
+                _ when CSharpTypeRegex().IsMatch(token) => ConsoleUi.CodeType(token),
+                _ when CSharpKeywordRegex().IsMatch(token) => ConsoleUi.CodeKeyword(token),
+                _ when NumberRegex().IsMatch(token) => ConsoleUi.CodeNumber(token),
+                _ => ConsoleUi.Code(token)
+            }),
+            "json" => HighlightByPattern(text, JsonTokenRegex(), token => token switch
+            {
+                _ when token.StartsWith("\"", StringComparison.Ordinal) => ConsoleUi.CodeString(token),
+                _ when JsonKeywordRegex().IsMatch(token) => ConsoleUi.CodeKeyword(token),
+                _ when NumberRegex().IsMatch(token) => ConsoleUi.CodeNumber(token),
+                _ when JsonSymbolRegex().IsMatch(token) => ConsoleUi.CodeSymbol(token),
+                _ => ConsoleUi.Code(token)
+            }),
+            "bash" => HighlightByPattern(text, BashTokenRegex(), token => token switch
+            {
+                _ when token.StartsWith("#", StringComparison.Ordinal) => ConsoleUi.CodeComment(token),
+                _ when token.StartsWith("\"", StringComparison.Ordinal) || token.StartsWith("'", StringComparison.Ordinal) => ConsoleUi.CodeString(token),
+                _ when token.StartsWith("$", StringComparison.Ordinal) => ConsoleUi.CodeType(token),
+                _ when BashKeywordRegex().IsMatch(token) => ConsoleUi.CodeKeyword(token),
+                _ when NumberRegex().IsMatch(token) => ConsoleUi.CodeNumber(token),
+                _ => ConsoleUi.Code(token)
+            }),
+            _ => ConsoleUi.Code(text)
+        };
+    }
+
+    private static string HighlightByPattern(string text, Regex pattern, Func<string, string> colorize)
+    {
+        var builder = new StringBuilder();
+        var lastIndex = 0;
+
+        foreach (Match match in pattern.Matches(text))
+        {
+            if (match.Index > lastIndex)
+            {
+                builder.Append(ConsoleUi.Code(text[lastIndex..match.Index]));
+            }
+
+            builder.Append(colorize(match.Value));
+            lastIndex = match.Index + match.Length;
+        }
+
+        if (lastIndex < text.Length)
+        {
+            builder.Append(ConsoleUi.Code(text[lastIndex..]));
+        }
+
+        return builder.ToString();
+    }
+
+    private static string NormalizeLanguage(string language) => language.Trim().ToLowerInvariant() switch
+    {
+        "cs" => "csharp",
+        "sh" => "bash",
+        "shell" => "bash",
+        _ => language.Trim().ToLowerInvariant()
+    };
 
     private static IReadOnlyList<string> WrapText(string text, int firstWidth, int? continuationWidth = null)
     {
@@ -469,6 +540,33 @@ internal static partial class TerminalMarkdown
 
     [GeneratedRegex(@"`([^`]+)`")]
     private static partial Regex InlineCodeRegex();
+
+    [GeneratedRegex(@"//.*|@?""(?:[^""\\]|\\.)*""|'(?:[^'\\]|\\.)*'|\b(?:abstract|as|async|await|base|break|case|catch|class|const|continue|default|do|else|enum|event|explicit|extern|false|finally|for|foreach|if|implicit|in|interface|internal|is|lock|namespace|new|null|operator|out|override|params|private|protected|public|readonly|record|required|return|sealed|static|struct|switch|this|throw|true|try|typeof|using|var|virtual|void|while|get|set|init)\b|\b(?:bool|byte|char|decimal|double|float|int|long|object|sbyte|short|string|uint|ulong|ushort)\b|\b\d+(?:\.\d+)?\b")]
+    private static partial Regex CSharpTokenRegex();
+
+    [GeneratedRegex(@"^(?:bool|byte|char|decimal|double|float|int|long|object|sbyte|short|string|uint|ulong|ushort)$")]
+    private static partial Regex CSharpTypeRegex();
+
+    [GeneratedRegex(@"^(?:abstract|as|async|await|base|break|case|catch|class|const|continue|default|do|else|enum|event|explicit|extern|false|finally|for|foreach|if|implicit|in|interface|internal|is|lock|namespace|new|null|operator|out|override|params|private|protected|public|readonly|record|required|return|sealed|static|struct|switch|this|throw|true|try|typeof|using|var|virtual|void|while|get|set|init)$")]
+    private static partial Regex CSharpKeywordRegex();
+
+    [GeneratedRegex(@"""(?:[^""\\]|\\.)*""|\b(?:true|false|null)\b|\b\d+(?:\.\d+)?\b|[{}\[\]:,]")]
+    private static partial Regex JsonTokenRegex();
+
+    [GeneratedRegex(@"^(?:true|false|null)$")]
+    private static partial Regex JsonKeywordRegex();
+
+    [GeneratedRegex(@"^[{}\[\]:,]$")]
+    private static partial Regex JsonSymbolRegex();
+
+    [GeneratedRegex(@"#.*|""(?:[^""\\]|\\.)*""|'(?:[^'\\]|\\.)*'|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\b(?:if|then|else|elif|fi|for|while|do|done|case|esac|function|in|local|export|return)\b|\b\d+\b")]
+    private static partial Regex BashTokenRegex();
+
+    [GeneratedRegex(@"^(?:if|then|else|elif|fi|for|while|do|done|case|esac|function|in|local|export|return)$")]
+    private static partial Regex BashKeywordRegex();
+
+    [GeneratedRegex(@"^\d+(?:\.\d+)?$")]
+    private static partial Regex NumberRegex();
 
     [GeneratedRegex(@"\*\*([^*]+)\*\*")]
     private static partial Regex BoldAsteriskRegex();

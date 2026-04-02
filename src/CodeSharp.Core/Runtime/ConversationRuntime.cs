@@ -4,6 +4,13 @@ public record ConversationRuntimeCheckpoint(int MessageCount, UsageTrackerSnapsh
 
 public class ConversationRuntime
 {
+    private static readonly HashSet<string> ParallelSafeTools = new(StringComparer.Ordinal)
+    {
+        "read_file",
+        "glob_search",
+        "grep_search"
+    };
+
     private readonly Session _session;
     private readonly IApiClient _apiClient;
     private readonly IToolExecutor _toolExecutor;
@@ -88,71 +95,16 @@ public class ConversationRuntime
             {
                 break;
             }
-            
-            foreach (var (toolUseId, toolName, input) in pendingToolUses)
+
+            var iterationResults = await ExecutePendingToolUsesAsync(
+                pendingToolUses,
+                prompter,
+                activitySink,
+                cancellationToken
+            );
+
+            foreach (var resultMessage in iterationResults)
             {
-                var permissionResult = prompter is not null
-                    ? _permissionPolicy.Authorize(toolName, input, prompter)
-                    : _permissionPolicy.Authorize(toolName, input);
-                
-                ConversationMessage resultMessage;
-                
-                if (permissionResult.Outcome == PermissionOutcome.Allow)
-                {
-                    var preHookResult = await _hookRunner.RunPreToolUseAsync(toolName, input, cancellationToken);
-                    
-                    if (preHookResult.IsDenied)
-                    {
-                        var denyMessage = $"PreToolUse hook denied tool `{toolName}`";
-                        resultMessage = ConversationMessage.ToolResult(
-                            toolUseId,
-                            toolName,
-                            FormatHookMessage(preHookResult, denyMessage),
-                            true
-                        );
-                    }
-                    else
-                    {
-                        activitySink?.Invoke(new RuntimeActivity.ToolStarted(toolName, input));
-                        var (output, isError) = await ExecuteToolWithErrorHandlingAsync(
-                            toolName, input, cancellationToken
-                        );
-                        activitySink?.Invoke(new RuntimeActivity.ToolFinished(toolName, isError));
-                        
-                        output = MergeHookFeedback(preHookResult.Messages, output, false);
-                        
-                        var postHookResult = await _hookRunner.RunPostToolUseAsync(
-                            toolName, input, output, isError, cancellationToken
-                        );
-                        
-                        if (postHookResult.IsDenied)
-                        {
-                            isError = true;
-                        }
-                        
-                        output = MergeHookFeedback(postHookResult.Messages, output, postHookResult.IsDenied);
-                        
-                        resultMessage = ConversationMessage.ToolResult(toolUseId, toolName, output, isError);
-                    }
-                }
-                else if (permissionResult.Reason == UserInterruptMessage)
-                {
-                    throw new RuntimeError(UserInterruptMessage);
-                }
-                else
-                {
-                    activitySink?.Invoke(new RuntimeActivity.ToolBlocked(
-                        toolName,
-                        permissionResult.Reason ?? "Permission denied"
-                    ));
-                    resultMessage = ConversationMessage.ToolResult(
-                        toolUseId,
-                        toolName,
-                        permissionResult.Reason ?? "Permission denied",
-                        true
-                    );
-                }
-                
                 _session.AddMessage(resultMessage);
                 toolResults.Add(resultMessage);
             }
@@ -185,6 +137,156 @@ public class ConversationRuntime
         {
             return (ex.Message, true);
         }
+    }
+
+    private async Task<IReadOnlyList<ConversationMessage>> ExecutePendingToolUsesAsync(
+        IReadOnlyList<(string ToolUseId, string ToolName, string Input)> pendingToolUses,
+        IPermissionPrompter? prompter,
+        Action<RuntimeActivity>? activitySink,
+        CancellationToken cancellationToken
+    )
+    {
+        var results = new ConversationMessage[pendingToolUses.Count];
+        var parallelBatch = new List<PreparedToolExecution>();
+
+        for (var index = 0; index < pendingToolUses.Count; index++)
+        {
+            var (toolUseId, toolName, input) = pendingToolUses[index];
+            var prepared = await PrepareToolExecutionAsync(
+                index,
+                toolUseId,
+                toolName,
+                input,
+                prompter,
+                activitySink,
+                cancellationToken
+            );
+
+            if (IsParallelSafeTool(toolName))
+            {
+                parallelBatch.Add(prepared);
+                continue;
+            }
+
+            await FlushParallelBatchAsync(parallelBatch, results, cancellationToken);
+            results[index] = await prepared.ExecuteAsync(cancellationToken);
+        }
+
+        await FlushParallelBatchAsync(parallelBatch, results, cancellationToken);
+
+        return results;
+    }
+
+    private async Task<PreparedToolExecution> PrepareToolExecutionAsync(
+        int index,
+        string toolUseId,
+        string toolName,
+        string input,
+        IPermissionPrompter? prompter,
+        Action<RuntimeActivity>? activitySink,
+        CancellationToken cancellationToken
+    )
+    {
+        var permissionResult = prompter is not null
+            ? _permissionPolicy.Authorize(toolName, input, prompter)
+            : _permissionPolicy.Authorize(toolName, input);
+
+        if (permissionResult.Outcome != PermissionOutcome.Allow)
+        {
+            if (permissionResult.Reason == UserInterruptMessage)
+            {
+                throw new RuntimeError(UserInterruptMessage);
+            }
+
+            activitySink?.Invoke(new RuntimeActivity.ToolBlocked(
+                toolUseId,
+                toolName,
+                permissionResult.Reason ?? "Permission denied"
+            ));
+
+            var blocked = ConversationMessage.ToolResult(
+                toolUseId,
+                toolName,
+                permissionResult.Reason ?? "Permission denied",
+                true
+            );
+
+            return new PreparedToolExecution(index, _ => Task.FromResult(blocked));
+        }
+
+        var preHookResult = await _hookRunner.RunPreToolUseAsync(toolName, input, cancellationToken);
+        if (preHookResult.IsDenied)
+        {
+            var denyMessage = $"PreToolUse hook denied tool `{toolName}`";
+            var denied = ConversationMessage.ToolResult(
+                toolUseId,
+                toolName,
+                FormatHookMessage(preHookResult, denyMessage),
+                true
+            );
+
+            return new PreparedToolExecution(index, _ => Task.FromResult(denied));
+        }
+
+        return new PreparedToolExecution(
+            index,
+            ct => ExecutePreparedToolAsync(toolUseId, toolName, input, preHookResult, activitySink, ct)
+        );
+    }
+
+    private async Task<ConversationMessage> ExecutePreparedToolAsync(
+        string toolUseId,
+        string toolName,
+        string input,
+        HookRunResult preHookResult,
+        Action<RuntimeActivity>? activitySink,
+        CancellationToken cancellationToken
+    )
+    {
+        activitySink?.Invoke(new RuntimeActivity.ToolStarted(toolUseId, toolName, input));
+        var (output, isError) = await ExecuteToolWithErrorHandlingAsync(toolName, input, cancellationToken);
+        activitySink?.Invoke(new RuntimeActivity.ToolFinished(toolUseId, toolName, isError));
+
+        output = MergeHookFeedback(preHookResult.Messages, output, false);
+
+        var postHookResult = await _hookRunner.RunPostToolUseAsync(
+            toolName,
+            input,
+            output,
+            isError,
+            cancellationToken
+        );
+
+        if (postHookResult.IsDenied)
+        {
+            isError = true;
+        }
+
+        output = MergeHookFeedback(postHookResult.Messages, output, postHookResult.IsDenied);
+
+        return ConversationMessage.ToolResult(toolUseId, toolName, output, isError);
+    }
+
+    private static bool IsParallelSafeTool(string toolName) => ParallelSafeTools.Contains(toolName);
+
+    private static async Task FlushParallelBatchAsync(
+        List<PreparedToolExecution> parallelBatch,
+        ConversationMessage[] results,
+        CancellationToken cancellationToken
+    )
+    {
+        if (parallelBatch.Count == 0)
+        {
+            return;
+        }
+
+        var completed = await Task.WhenAll(parallelBatch.Select(run => run.RunAsync(cancellationToken)));
+        foreach (var (index, message) in completed)
+        {
+            results[index] = message;
+        }
+
+        parallelBatch.Clear();
     }
     
     private static (ConversationMessage Message, TokenUsage? Usage) BuildAssistantMessage(
@@ -259,5 +361,14 @@ public class ConversationRuntime
         sections.Add($"{label}:\n{string.Join("\n", messages)}");
         
         return string.Join("\n\n", sections);
+    }
+
+    private sealed record PreparedToolExecution(
+        int Index,
+        Func<CancellationToken, Task<ConversationMessage>> ExecuteAsync
+    )
+    {
+        public async Task<(int Index, ConversationMessage Message)> RunAsync(CancellationToken cancellationToken) =>
+            (Index, await ExecuteAsync(cancellationToken));
     }
 }

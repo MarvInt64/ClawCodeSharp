@@ -91,9 +91,14 @@ public class OpenAiCompatClient : IProvider
         var messageStopped = false;
         var activeToolCallIndexes = new HashSet<int>();
         
-        while (!reader.EndOfStream && !cancellationToken.IsCancellationRequested)
+        while (!cancellationToken.IsCancellationRequested)
         {
             var line = await reader.ReadLineAsync(cancellationToken);
+            if (line is null)
+            {
+                break;
+            }
+
             if (string.IsNullOrEmpty(line))
                 continue;
             

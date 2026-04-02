@@ -25,11 +25,11 @@ public record TurnSummary(
 
 public abstract record RuntimeActivity
 {
-    public sealed record ToolStarted(string ToolName, string Input) : RuntimeActivity;
+    public sealed record ToolStarted(string ToolUseId, string ToolName, string Input) : RuntimeActivity;
 
-    public sealed record ToolFinished(string ToolName, bool IsError) : RuntimeActivity;
+    public sealed record ToolFinished(string ToolUseId, string ToolName, bool IsError) : RuntimeActivity;
 
-    public sealed record ToolBlocked(string ToolName, string Reason) : RuntimeActivity;
+    public sealed record ToolBlocked(string ToolUseId, string ToolName, string Reason) : RuntimeActivity;
 }
 
 public interface IApiClient

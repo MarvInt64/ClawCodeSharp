@@ -17,6 +17,7 @@ internal enum ActivityLineStatus
 }
 
 internal sealed record ActivityLine(
+    string ToolUseId,
     string ToolName,
     string Description,
     ActivityLineStatus Status,
@@ -42,6 +43,7 @@ internal sealed class TurnActivityState
             {
                 case RuntimeActivity.ToolStarted started:
                     _lines.Add(new ActivityLine(
+                        started.ToolUseId,
                         started.ToolName,
                         Program.DescribeToolStart(started.ToolName, started.Input),
                         ActivityLineStatus.Running
@@ -49,7 +51,7 @@ internal sealed class TurnActivityState
                     break;
                 case RuntimeActivity.ToolFinished finished:
                 {
-                    var index = FindLastRunningIndex(finished.ToolName);
+                    var index = FindLastRunningIndex(finished.ToolUseId);
                     if (index >= 0)
                     {
                         var existing = _lines[index];
@@ -61,6 +63,7 @@ internal sealed class TurnActivityState
                     else
                     {
                         _lines.Add(new ActivityLine(
+                            finished.ToolUseId,
                             finished.ToolName,
                             finished.ToolName,
                             finished.IsError ? ActivityLineStatus.Error : ActivityLineStatus.Success
@@ -70,7 +73,7 @@ internal sealed class TurnActivityState
                 }
                 case RuntimeActivity.ToolBlocked blocked:
                 {
-                    var index = FindLastRunningIndex(blocked.ToolName);
+                    var index = FindLastRunningIndex(blocked.ToolUseId);
                     if (index >= 0)
                     {
                         var existing = _lines[index];
@@ -83,6 +86,7 @@ internal sealed class TurnActivityState
                     else
                     {
                         _lines.Add(new ActivityLine(
+                            blocked.ToolUseId,
                             blocked.ToolName,
                             blocked.ToolName,
                             ActivityLineStatus.Blocked,
@@ -108,11 +112,11 @@ internal sealed class TurnActivityState
         }
     }
 
-    private int FindLastRunningIndex(string toolName)
+    private int FindLastRunningIndex(string toolUseId)
     {
         for (var i = _lines.Count - 1; i >= 0; i--)
         {
-            if (_lines[i].ToolName == toolName && _lines[i].Status == ActivityLineStatus.Running)
+            if (_lines[i].ToolUseId == toolUseId && _lines[i].Status == ActivityLineStatus.Running)
             {
                 return i;
             }
