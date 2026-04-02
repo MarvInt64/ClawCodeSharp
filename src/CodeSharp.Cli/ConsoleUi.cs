@@ -20,7 +20,11 @@ internal static class ConsoleUi
 
     public static string AccentBadge(string text) => Paint(text, "1;30;48;5;45");
 
-    public static string Muted(string text) => Paint(text, "2;37");
+    public static string Muted(string text) => Paint(text, "38;5;250");
+
+    public static string Label(string text) => Paint(text, "1;38;5;252");
+
+    public static string Footer(string text) => Paint(text, "38;5;252");
 
     public static string Strong(string text) => Paint(text, "1");
 
@@ -44,7 +48,7 @@ internal static class ConsoleUi
 
     public static string Error(string text) => Paint(text, "38;5;203");
 
-    public static string AssistantPlan(string text) => $"{AccentBadge(" NEXT ")} {Strong(text)}";
+    public static string AssistantPlan(string text) => $"{AccentBadge(" PLAN ")} {Strong(text)}";
 
     public static string Panel(
         string title,
@@ -60,7 +64,7 @@ internal static class ConsoleUi
             builder
                 .Append(Accent("│"))
                 .Append(' ')
-                .Append(Muted($"{label,-14}"))
+                .Append(Label($"{label,-14}"))
                 .Append(' ')
                 .AppendLine(value);
         }
@@ -68,7 +72,7 @@ internal static class ConsoleUi
         builder.Append(Accent("╰─"));
         if (!string.IsNullOrWhiteSpace(footer))
         {
-            builder.Append(' ').Append(Muted(footer));
+            builder.Append(' ').Append(Footer(footer));
         }
 
         return builder.ToString();
@@ -98,7 +102,7 @@ internal static class ConsoleUi
         builder.Append(Accent("╰─"));
         if (!string.IsNullOrWhiteSpace(footer))
         {
-            builder.Append(' ').Append(Muted(footer));
+            builder.Append(' ').Append(Footer(footer));
         }
 
         return builder.ToString();
@@ -123,11 +127,14 @@ internal static class ConsoleUi
         builder.Append(Accent("╰─"));
         if (!string.IsNullOrWhiteSpace(footer))
         {
-            builder.Append(' ').Append(Muted(footer));
+            builder.Append(' ').Append(Footer(footer));
         }
 
         return builder.ToString();
     }
+
+    public static string UserTurn(string text) =>
+        MessageBlock("you", text);
 
     public static string AssistantTurn(string text, TokenUsage usage, IReadOnlyList<string> toolNames, int iterations)
     {

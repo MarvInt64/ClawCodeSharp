@@ -468,12 +468,13 @@ Add any additional context about the project.
             options.PermissionMode,
             sessionPath
         );
-        
-        Console.WriteLine(repl.StartupBanner());
-        Console.WriteLine();
 
         var prompt = ConsoleUi.Prompt();
-        var console = new ReplConsole(prompt, repl.CompletionCandidates);
+        var console = new ReplConsole(
+            prompt,
+            repl.CompletionCandidates,
+            repl.StartupBanner().Replace("\r\n", "\n").Split('\n')
+        );
         var busyLabel = $"Thinking with {FormatProvider(provider)} · {options.Model}";
         var queuedInputs = new Queue<string>();
         ActiveTurn? activeTurn = null;
@@ -482,7 +483,7 @@ Add any additional context about the project.
 
         using var interrupts = new ConsoleInterruptRelay();
 
-        console.RenderIdlePrompt();
+        console.InitializeScreen();
 
         while (!exitRequested)
         {
@@ -508,8 +509,7 @@ Add any additional context about the project.
                 }
                 else
                 {
-                    Console.WriteLine();
-                    Console.WriteLine(ConsoleUi.Warning("Press Ctrl+C again to quit."));
+                    console.SetContent(ConsoleUi.Warning("Press Ctrl+C again to quit."));
                     if (activeTurn is not null)
                     {
                         console.EnterBusy(busyLabel, queuedInputs, activeTurn.Activity.Snapshot());
@@ -531,23 +531,20 @@ Add any additional context about the project.
 
                 if (result.Interrupted)
                 {
-                    Console.WriteLine(ConsoleUi.Warning("Request canceled."));
-                    Console.WriteLine();
+                    console.SetContent(ConsoleUi.Warning("Request canceled."));
                 }
                 else if (result.Error is not null)
                 {
-                    Console.Error.WriteLine(ConsoleUi.ErrorBlock(result.Error));
-                    Console.WriteLine();
+                    console.SetContent(ConsoleUi.ErrorBlock(result.Error));
                 }
                 else
                 {
-                    Console.WriteLine(ConsoleUi.AssistantTurn(
+                    console.SetContent(ConsoleUi.AssistantTurn(
                         ExtractAssistantText(result.Summary!),
                         result.Summary!.Usage,
                         ExtractToolNames(result.Summary!),
                         result.Summary!.Iterations
                     ));
-                    Console.WriteLine();
                 }
 
                 if (queuedInputs.Count == 0)
@@ -787,6 +784,7 @@ Add any additional context about the project.
 
         var cts = new CancellationTokenSource();
         var activity = new TurnActivityState();
+        console.SetContent(ConsoleUi.UserTurn(trimmed));
         var task = ExecuteTurnAsync(runtime, trimmed, activity, cts.Token);
         setActiveTurn(new ActiveTurn(task, cts, activity));
         console.EnterBusy(busyLabel, queuedInputs, activity.Snapshot());
@@ -838,19 +836,14 @@ Add any additional context about the project.
         {
             console.LeaveBusy();
         }
-        else
-        {
-            Console.WriteLine();
-        }
-
-        Console.WriteLine(ConsoleUi.MessageBlock(
+        
+        console.SetContent(ConsoleUi.MessageBlock(
             "exit",
             "Quit CodeSharp?",
             "Press y to quit, any other key to stay."
         ));
 
         var key = Console.ReadKey(intercept: true);
-        Console.WriteLine();
 
         var confirmed = key.Key == ConsoleKey.Y;
         if (!confirmed)

@@ -32,12 +32,13 @@ internal sealed class ReplConsole
     private readonly StringBuilder _draft = new();
     private readonly string _prompt;
     private readonly IReadOnlyList<string> _slashCommands;
+    private readonly IReadOnlyList<string> _headerLines;
     private readonly object _gate = new();
     private bool _busyVisible;
-    private int _busyRenderLines;
-    private int _idleRenderLines;
+    private int _bodyRenderLines;
     private int _spinnerIndex;
     private string _busyLabel = "Thinking";
+    private IReadOnlyList<string> _contentLines = [];
     private IReadOnlyList<string> _queuedPreview = [];
     private IReadOnlyList<string> _activityPreview = [];
     private IReadOnlyList<string> _completionMatches = [];
@@ -45,10 +46,59 @@ internal sealed class ReplConsole
 
     private static readonly string[] SpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-    public ReplConsole(string prompt, IEnumerable<string>? slashCommands = null)
+    public ReplConsole(
+        string prompt,
+        IEnumerable<string>? slashCommands = null,
+        IEnumerable<string>? headerLines = null
+    )
     {
         _prompt = prompt;
         _slashCommands = (slashCommands ?? []).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(static c => c, StringComparer.OrdinalIgnoreCase).ToList();
+        _headerLines = NormalizeLines(headerLines);
+    }
+
+    public void InitializeScreen()
+    {
+        lock (_gate)
+        {
+            try
+            {
+                Console.Clear();
+            }
+            catch
+            {
+            }
+
+            foreach (var line in _headerLines)
+            {
+                Console.WriteLine(line);
+            }
+
+            if (_headerLines.Count > 0)
+            {
+                Console.WriteLine();
+            }
+
+            _bodyRenderLines = 0;
+            _busyVisible = false;
+            RenderIdleLocked();
+        }
+    }
+
+    public void SetContent(string? block)
+    {
+        lock (_gate)
+        {
+            _contentLines = NormalizeLines(block);
+            if (_busyVisible)
+            {
+                RenderBusyFrameLocked();
+            }
+            else
+            {
+                RenderIdleLocked();
+            }
+        }
     }
 
     public bool HasDraft
@@ -100,16 +150,6 @@ internal sealed class ReplConsole
                 {
                     var draftText = _draft.ToString();
                     var submitted = draftText.Trim();
-
-                    if (!busy)
-                    {
-                        ClearIdleBlockLocked();
-                        Console.WriteLine(
-                            string.IsNullOrWhiteSpace(draftText)
-                                ? string.Empty
-                                : $"{_prompt}{draftText}"
-                        );
-                    }
 
                     _draft.Clear();
                     ResetCompletionStateLocked();
@@ -309,7 +349,6 @@ internal sealed class ReplConsole
                 _busyVisible = true;
             }
 
-            ClearIdleBlockLocked();
             _queuedPreview = SnapshotQueuedInputs(queuedInputs);
             _activityPreview = SnapshotActivityLines(activityLines);
             RenderBusyFrameLocked();
@@ -345,11 +384,10 @@ internal sealed class ReplConsole
                 return;
             }
 
-            ClearBusyBlockLocked();
             _busyVisible = false;
-            _busyRenderLines = 0;
             _queuedPreview = [];
             _activityPreview = [];
+            RenderIdleLocked();
         }
     }
 
@@ -374,34 +412,40 @@ internal sealed class ReplConsole
             return;
         }
 
-        var lines = new List<string> { BuildStatus(_busyLabel) };
-        lines.AddRange(_activityPreview.Select(line => $"  {line}"));
+        var lines = BuildContentLinesLocked();
+        lines.Add(BuildStatus(_busyLabel));
+        foreach (var activityLine in _activityPreview)
+        {
+            lines.AddRange(WrapDisplayLine(activityLine, "  ", "    "));
+        }
         lines.AddRange(_queuedPreview.Select((message, index) => $"  {index + 1}. {message}"));
         lines.Add(BuildPromptLineLocked());
 
-        ClearBusyBlockLocked();
-        WriteBlockLocked(lines);
-        _busyRenderLines = lines.Count;
+        RenderBodyLocked(lines);
     }
 
     private void RenderIdleLocked()
     {
-        var lines = BuildIdleLinesLocked();
-        ClearIdleBlockLocked();
+        RenderBodyLocked(BuildIdleLinesLocked());
+    }
+
+    private void RenderBodyLocked(IReadOnlyList<string> lines)
+    {
+        ClearRenderedBlockLocked(_bodyRenderLines);
         WriteBlockLocked(lines);
-        _idleRenderLines = lines.Count;
+        _bodyRenderLines = lines.Count;
     }
 
-    private void ClearBusyBlockLocked()
+    private List<string> BuildContentLinesLocked()
     {
-        ClearRenderedBlockLocked(_busyRenderLines);
-        _busyRenderLines = 0;
-    }
+        var lines = new List<string>();
+        if (_contentLines.Count > 0)
+        {
+            lines.AddRange(_contentLines);
+            lines.Add(string.Empty);
+        }
 
-    private void ClearIdleBlockLocked()
-    {
-        ClearRenderedBlockLocked(_idleRenderLines);
-        _idleRenderLines = 0;
+        return lines;
     }
 
     private static void ClearRenderedBlockLocked(int lineCount)
@@ -447,7 +491,7 @@ internal sealed class ReplConsole
 
     private List<string> BuildIdleLinesLocked()
     {
-        var lines = new List<string>();
+        var lines = BuildContentLinesLocked();
         lines.AddRange(BuildSuggestionLinesLocked());
         lines.Add(BuildPromptLineLocked());
         return lines;
@@ -502,4 +546,85 @@ internal sealed class ReplConsole
 
         return $"{singleLine[..(maxLength - 1)]}…";
     }
+
+    private static IReadOnlyList<string> WrapDisplayLine(string text, string firstPrefix, string continuationPrefix)
+    {
+        var availableWidth = Math.Max(20, ConsoleUi.ContentWidth() - VisibleLength(firstPrefix));
+        var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length == 0)
+        {
+            return [$"{firstPrefix}{text}"];
+        }
+
+        var lines = new List<string>();
+        var currentPrefix = firstPrefix;
+        var current = new StringBuilder();
+
+        foreach (var word in words)
+        {
+            var candidate = current.Length == 0 ? word : $"{current} {word}";
+            if (VisibleLength(candidate) <= availableWidth)
+            {
+                current.Clear();
+                current.Append(candidate);
+                continue;
+            }
+
+            if (current.Length == 0)
+            {
+                lines.Add($"{currentPrefix}{word}");
+                currentPrefix = continuationPrefix;
+                continue;
+            }
+
+            lines.Add($"{currentPrefix}{current}");
+            current.Clear();
+            current.Append(word);
+            currentPrefix = continuationPrefix;
+        }
+
+        if (current.Length > 0)
+        {
+            lines.Add($"{currentPrefix}{current}");
+        }
+
+        return lines;
+    }
+
+    private static int VisibleLength(string text)
+    {
+        var length = 0;
+        var inEscape = false;
+
+        foreach (var ch in text)
+        {
+            if (inEscape)
+            {
+                if (ch == 'm')
+                {
+                    inEscape = false;
+                }
+
+                continue;
+            }
+
+            if (ch == '\u001b')
+            {
+                inEscape = true;
+                continue;
+            }
+
+            length++;
+        }
+
+        return length;
+    }
+
+    private static IReadOnlyList<string> NormalizeLines(IEnumerable<string>? lines) =>
+        lines?.SelectMany(static line => line.Replace("\r\n", "\n").Split('\n')).ToList() ?? [];
+
+    private static IReadOnlyList<string> NormalizeLines(string? block) =>
+        string.IsNullOrWhiteSpace(block)
+            ? []
+            : block.Replace("\r\n", "\n").Split('\n');
 }

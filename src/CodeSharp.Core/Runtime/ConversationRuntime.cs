@@ -318,19 +318,9 @@ public class ConversationRuntime
             return BuildToolPlanFallback(pendingToolUses);
         }
 
-        var firstSentenceEnd = singleLine.IndexOfAny(['.', '!', '?']);
-        var preview = firstSentenceEnd >= 0
-            ? singleLine[..(firstSentenceEnd + 1)]
-            : singleLine;
-
-        const int maxLength = 120;
-        var normalized = preview.Length <= maxLength
-            ? preview
-            : $"{preview[..(maxLength - 1)]}…";
-
-        if (!string.IsNullOrWhiteSpace(normalized))
+        if (!string.IsNullOrWhiteSpace(singleLine))
         {
-            return normalized;
+            return singleLine;
         }
 
         return BuildToolPlanFallback(pendingToolUses);
