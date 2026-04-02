@@ -3,3 +3,4 @@ src/Claw.Api/obj
 src/Claw.Api/bin
 obj/
 bin/
+.idea

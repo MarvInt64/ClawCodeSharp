@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <LangVersion>preview</LangVersion>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>codesharp</ToolCommandName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\CodeSharp.Core\CodeSharp.Core.csproj" />
+    <ProjectReference Include="..\CodeSharp.Api\CodeSharp.Api.csproj" />
+    <ProjectReference Include="..\CodeSharp.Tools\CodeSharp.Tools.csproj" />
+    <ProjectReference Include="..\CodeSharp.Plugins\CodeSharp.Plugins.csproj" />
+    <ProjectReference Include="..\CodeSharp.Lsp\CodeSharp.Lsp.csproj" />
+    <ProjectReference Include="..\CodeSharp.Commands\CodeSharp.Commands.csproj" />
+  </ItemGroup>
+</Project>
