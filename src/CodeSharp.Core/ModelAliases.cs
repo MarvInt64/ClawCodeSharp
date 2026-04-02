@@ -2,7 +2,7 @@ namespace CodeSharp.Core;
 
 public static class ModelAliases
 {
-    public const string DefaultModel = "claude-opus-4-6";
+    public const string DefaultModel = "moonshotai/kimi-k2.5";
     public const string DefaultDate = "2026-03-31";
     
     public static string ResolveModelAlias(string model) => model.ToLowerInvariant() switch

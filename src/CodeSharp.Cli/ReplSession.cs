@@ -126,7 +126,8 @@ public class ReplSession
                 
             case SlashCommandKind.Config:
             {
-                var result = ConfigCommandProcessor.Process(command.Section, _globalSettingsStore);
+                var headerLines = StartupBanner().Replace("\r\n", "\n").Split('\n');
+                var result = ConfigCommandProcessor.Process(command.Section, _globalSettingsStore, headerLines);
                 var footer = string.IsNullOrWhiteSpace(command.Section)
                     ? "Global defaults apply to new CodeSharp sessions."
                     : result.Footer;

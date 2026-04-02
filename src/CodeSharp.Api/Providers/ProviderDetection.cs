@@ -25,6 +25,7 @@ public static class ProviderDetection
         "grok" => "grok-3",
         "grok-mini" => "grok-3-mini",
         "glm5" => "z-ai/glm5",
+        "kimi2.5" => "moonshotai/kimi-k2.5",
         _ => model
     };
 }

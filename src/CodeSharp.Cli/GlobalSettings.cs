@@ -108,14 +108,14 @@ internal sealed record ConfigCommandResult(string Title, string Body, string? Fo
 
 internal static class ConfigCommandProcessor
 {
-    public static ConfigCommandResult Process(string? args, GlobalSettingsStore store)
+    public static ConfigCommandResult Process(string? args, GlobalSettingsStore store, IReadOnlyList<string>? headerLines = null)
     {
         var settings = store.Load();
         var tokens = Tokenize(args);
 
         if (tokens.Count == 0)
         {
-            return RunInteractiveMenu(store);
+            return RunInteractiveMenu(store, headerLines);
         }
 
         if (tokens[0].Equals("show", StringComparison.OrdinalIgnoreCase))
@@ -136,7 +136,7 @@ internal static class ConfigCommandProcessor
         };
     }
 
-    private static ConfigCommandResult RunInteractiveMenu(GlobalSettingsStore store)
+    private static ConfigCommandResult RunInteractiveMenu(GlobalSettingsStore store, IReadOnlyList<string>? headerLines)
     {
         if (Console.IsInputRedirected)
         {
@@ -157,29 +157,30 @@ internal static class ConfigCommandProcessor
                     ("Done", "Close config")
                 ],
                 "Use ↑/↓ to move, Enter to select, Esc to close.",
-                allowEscape: true
+                allowEscape: true,
+                headerLines: headerLines
             );
 
             switch (choice)
             {
                 case 0:
-                    SaveProviderFromMenu(store, settings);
+                    SaveProviderFromMenu(store, settings, headerLines);
                     break;
                 case 1:
-                    SaveModelFromMenu(store, settings);
+                    SaveModelFromMenu(store, settings, headerLines);
                     break;
                 case 2:
-                    ManageApiKeysFromMenu(store, settings);
+                    ManageApiKeysFromMenu(store, settings, headerLines);
                     break;
                 case 3:
-                    ClearValueFromMenu(store, settings);
+                    ClearValueFromMenu(store, settings, headerLines);
                     break;
                 case 4:
-                    PauseWithMessage("config", RenderSettings(settings, store.SettingsPath).Body, "Press any key to return.");
+                    PauseWithMessage("config", RenderSettings(settings, store.SettingsPath).Body, "Press any key to return.", headerLines);
                     break;
                 case 5:
                 case -1:
-                    Console.Clear();
+                    ClearAndRenderHeader(headerLines);
                     return new ConfigCommandResult(
                         "config",
                         "Global settings updated.",
@@ -369,14 +370,15 @@ Usage
         return $"{value[..4]}…{value[^4..]}";
     }
 
-    private static void SaveModelFromPrompt(GlobalSettingsStore store, GlobalSettings settings)
+    private static void SaveModelFromPrompt(GlobalSettingsStore store, GlobalSettings settings, IReadOnlyList<string>? headerLines)
     {
+        ClearAndRenderHeader(headerLines);
         Console.Write("Default model (empty clears): ");
         var model = Console.ReadLine();
         store.Save(settings.WithModel(model));
     }
 
-    private static void SaveModelFromMenu(GlobalSettingsStore store, GlobalSettings settings)
+    private static void SaveModelFromMenu(GlobalSettingsStore store, GlobalSettings settings, IReadOnlyList<string>? headerLines)
     {
         var choice = RunMenu(
             "model",
@@ -389,11 +391,13 @@ Usage
                 ("grok-3", "xAI flagship"),
                 ("grok-3-mini", "xAI smaller/faster"),
                 ("z-ai/glm5", "NVIDIA / Z.ai"),
+                ("moonshotai/kimi-k2.5", "NVIDIA Kimi 2.5"),
                 ("Custom...", settings.Model ?? "Enter any model id"),
                 ("Clear", "Remove stored default model")
             ],
             "Use ↑/↓ to move, Enter to select, Esc to go back.",
-            allowEscape: true
+            allowEscape: true,
+            headerLines: headerLines
         );
 
         switch (choice)
@@ -423,10 +427,12 @@ Usage
                 store.Save(settings.WithModel("z-ai/glm5"));
                 break;
             case 8:
-                Console.Clear();
-                SaveModelFromPrompt(store, settings);
+                store.Save(settings.WithModel("moonshotai/kimi-k2.5"));
                 break;
             case 9:
+                SaveModelFromPrompt(store, settings, headerLines);
+                break;
+            case 10:
                 store.Save(settings.WithModel(null));
                 break;
         }
@@ -467,7 +473,7 @@ Usage
         store.Save(settings.WithProvider(normalized));
     }
 
-    private static void SaveProviderFromMenu(GlobalSettingsStore store, GlobalSettings settings)
+    private static void SaveProviderFromMenu(GlobalSettingsStore store, GlobalSettings settings, IReadOnlyList<string>? headerLines)
     {
         var choice = RunMenu(
             "provider",
@@ -479,7 +485,8 @@ Usage
                 ("Clear", "Remove stored default provider")
             ],
             "Use ↑/↓ to move, Enter to select, Esc to go back.",
-            allowEscape: true
+            allowEscape: true,
+            headerLines: headerLines
         );
 
         switch (choice)
@@ -502,14 +509,15 @@ Usage
         }
     }
 
-    private static void SaveApiKeyFromPrompt(GlobalSettingsStore store, GlobalSettings settings, ProviderKind provider)
+    private static void SaveApiKeyFromPrompt(GlobalSettingsStore store, GlobalSettings settings, ProviderKind provider, IReadOnlyList<string>? headerLines)
     {
+        ClearAndRenderHeader(headerLines);
         var providerName = ProviderParsing.NormalizeProvider(provider);
         var apiKey = ReadSecret($"API key for {providerName} (empty clears): ");
         store.Save(settings.WithApiKey(provider, apiKey));
     }
 
-    private static void ManageApiKeysFromMenu(GlobalSettingsStore store, GlobalSettings settings)
+    private static void ManageApiKeysFromMenu(GlobalSettingsStore store, GlobalSettings settings, IReadOnlyList<string>? headerLines)
     {
         var choice = RunMenu(
             "api keys",
@@ -520,7 +528,8 @@ Usage
                 ("nvidia", MaskSecret(settings.ApiKeys?.Nvidia))
             ],
             "Use ↑/↓ to move, Enter to edit, Esc to go back.",
-            allowEscape: true
+            allowEscape: true,
+            headerLines: headerLines
         );
 
         var provider = choice switch
@@ -534,12 +543,11 @@ Usage
 
         if (provider is { } selectedProvider)
         {
-            Console.Clear();
-            SaveApiKeyFromPrompt(store, settings, selectedProvider);
+            SaveApiKeyFromPrompt(store, settings, selectedProvider, headerLines);
         }
     }
 
-    private static void ClearValueFromMenu(GlobalSettingsStore store, GlobalSettings settings)
+    private static void ClearValueFromMenu(GlobalSettingsStore store, GlobalSettings settings, IReadOnlyList<string>? headerLines)
     {
         var choice = RunMenu(
             "clear values",
@@ -552,7 +560,8 @@ Usage
                 ("NVIDIA key", MaskSecret(settings.ApiKeys?.Nvidia))
             ],
             "Use ↑/↓ to move, Enter to clear, Esc to go back.",
-            allowEscape: true
+            allowEscape: true,
+            headerLines: headerLines
         );
 
         var updated = choice switch
@@ -589,14 +598,15 @@ Usage
         string title,
         IReadOnlyList<(string Label, string Value)> items,
         string footer,
-        bool allowEscape = false
+        bool allowEscape = false,
+        IReadOnlyList<string>? headerLines = null
     )
     {
         var selected = 0;
 
         while (true)
         {
-            Console.Clear();
+            ClearAndRenderHeader(headerLines);
             Console.WriteLine(ConsoleUi.Panel(
                 title,
                 items.Select((item, index) => (
@@ -623,11 +633,34 @@ Usage
         }
     }
 
-    private static void PauseWithMessage(string title, string body, string? footer = null)
+    private static void PauseWithMessage(string title, string body, string? footer = null, IReadOnlyList<string>? headerLines = null)
     {
-        Console.Clear();
+        ClearAndRenderHeader(headerLines);
         Console.WriteLine(ConsoleUi.MessageBlock(title, body, footer));
         Console.ReadKey(intercept: true);
+    }
+
+    private static void ClearAndRenderHeader(IReadOnlyList<string>? headerLines)
+    {
+        try
+        {
+            Console.Clear();
+        }
+        catch
+        {
+        }
+
+        if (headerLines is null || headerLines.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var line in headerLines)
+        {
+            Console.WriteLine(line);
+        }
+
+        Console.WriteLine();
     }
 
     private static string? ReadSecret(string prompt)

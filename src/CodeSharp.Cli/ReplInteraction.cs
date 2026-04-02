@@ -436,6 +436,10 @@ internal sealed class ReplConsole
             lines.AddRange(wrappedActivityLines);
         }
         lines.AddRange(queuedLines);
+        if (_activityPreview.Count > 0 && !_activityPreview.Any(IsRunningActivityLine))
+        {
+            lines.Add(ConsoleUi.Muted("  waiting for assistant response..."));
+        }
         lines.Add(BuildStatus(_busyLabel));
         lines.Add(BuildPromptLineLocked());
 
@@ -585,6 +589,9 @@ internal sealed class ReplConsole
 
     private static IReadOnlyList<string> SnapshotActivityLines(IEnumerable<string>? activityLines) =>
         activityLines?.ToList() ?? [];
+
+    private static bool IsRunningActivityLine(string line) =>
+        line.TrimStart().StartsWith("⋯", StringComparison.Ordinal);
 
     private static string PreviewQueuedMessage(string input)
     {

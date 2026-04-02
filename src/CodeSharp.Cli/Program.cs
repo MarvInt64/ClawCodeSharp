@@ -194,7 +194,7 @@ public static class Program
             [
                 ("Usage", "codesharp [options] [prompt]"),
                 ("Modes", "Interactive REPL or one-shot prompt"),
-                ("Default model", "claude-opus-4-6"),
+                ("Default model", "moonshotai/kimi-k2.5"),
                 ("Providers", "anthropic · nvidia · openai · xai")
             ],
             "Run plain `codesharp` for the interactive agent shell."
