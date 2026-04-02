@@ -388,6 +388,7 @@ Usage
                 ("gpt-5-mini", "OpenAI smaller/faster"),
                 ("grok-3", "xAI flagship"),
                 ("grok-3-mini", "xAI smaller/faster"),
+                ("z-ai/glm5", "NVIDIA / Z.ai"),
                 ("Custom...", settings.Model ?? "Enter any model id"),
                 ("Clear", "Remove stored default model")
             ],
@@ -419,10 +420,13 @@ Usage
                 store.Save(settings.WithModel("grok-3-mini"));
                 break;
             case 7:
+                store.Save(settings.WithModel("z-ai/glm5"));
+                break;
+            case 8:
                 Console.Clear();
                 SaveModelFromPrompt(store, settings);
                 break;
-            case 8:
+            case 9:
                 store.Save(settings.WithModel(null));
                 break;
         }

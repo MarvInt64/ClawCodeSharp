@@ -14,6 +14,12 @@ The current C# CLI has already been improved in several practical areas:
 - Queued follow-up prompts are surfaced in the REPL instead of disappearing into the background, making multi-step interaction easier to follow.
 - Interrupt handling is more usable: `Ctrl+C` cancels the active turn first, and repeated interrupt handling supports a cleaner exit flow.
 - Internal activity messages are cleaner. Tool calls such as plan updates are shown as short human-readable status lines instead of raw JSON payloads like `TodoWrite {...}`.
+- The assistant now announces what it is about to inspect, search, or change, and this intent is highlighted more clearly in the REPL so the next step is easy to spot.
+- Slash commands now have interactive suggestions while typing, so entering `/` immediately shows matching commands and filters them live as you type.
+- Global provider, model, and API key defaults can be stored in `~/.codesharp/settings.json`, with a guided config flow in the CLI.
+- Repository search is more reliable: `glob_search` and `grep_search` now return counts plus capped samples instead of only raw lists, making broad codebase queries easier to verify.
+- Search tools now skip ignored build/editor directories and also respect the root `.gitignore`, reducing noisy matches from irrelevant files.
+- Broad negative claims are handled more carefully: the runtime and prompt now push the model to verify search results before saying something does not exist in the codebase.
 - Overall REPL output is easier to scan because user-facing status and assistant output now prioritize readability over raw protocol detail.
 
 

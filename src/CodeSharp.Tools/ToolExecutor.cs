@@ -9,11 +9,13 @@ public class ToolExecutor : IToolExecutor
 {
     private readonly GlobalToolRegistry _registry;
     private readonly string _workingDirectory;
+    private readonly GitIgnoreMatcher _gitIgnoreMatcher;
 
     public ToolExecutor(GlobalToolRegistry registry, string? workingDirectory = null)
     {
         _registry = registry;
         _workingDirectory = workingDirectory ?? Directory.GetCurrentDirectory();
+        _gitIgnoreMatcher = GitIgnoreMatcher.Load(_workingDirectory);
     }
 
     public async Task<ToolResult> ExecuteAsync(string toolName, string input, CancellationToken cancellationToken = default)
@@ -159,15 +161,21 @@ public class ToolExecutor : IToolExecutor
         var basePath = input.TryGetProperty("path", out var pathEl)
             ? pathEl.GetString() ?? _workingDirectory
             : _workingDirectory;
+        var limit = input.TryGetProperty("limit", out var limitEl) ? limitEl.GetInt32() : 200;
 
         var fullPath = Path.GetFullPath(basePath, _workingDirectory);
-        var files = Directory
-            .EnumerateFiles(fullPath, "*", SearchOption.AllDirectories)
+        var files = EnumerateSearchFiles(fullPath)
             .Select(file => Path.GetRelativePath(fullPath, file).Replace('\\', '/'))
             .Where(relativePath => GlobMatches(relativePath, pattern))
             .ToList();
 
-        return JsonSerializer.Serialize(new { pattern, files });
+        return JsonSerializer.Serialize(new
+        {
+            pattern,
+            totalFiles = files.Count,
+            files = files.Take(limit).ToList(),
+            truncated = files.Count > limit
+        });
     }
     
     private string ExecuteGrepSearch(JsonElement input)
@@ -176,31 +184,52 @@ public class ToolExecutor : IToolExecutor
         var basePath = input.TryGetProperty("path", out var pathEl) 
             ? pathEl.GetString() ?? _workingDirectory 
             : _workingDirectory;
-        var caseInsensitive = input.TryGetProperty("i", out var iEl) && iEl.GetBoolean();
+        var glob = input.TryGetProperty("glob", out var globEl)
+            ? globEl.GetString()
+            : null;
+        var caseInsensitive = !input.TryGetProperty("i", out var iEl) || iEl.GetBoolean();
+        var limit = input.TryGetProperty("limit", out var limitEl) ? limitEl.GetInt32() : 200;
         
         var options = caseInsensitive ? RegexOptions.IgnoreCase : RegexOptions.None;
         var regex = new Regex(pattern, options);
         
         var fullPath = Path.GetFullPath(basePath, _workingDirectory);
-        var files = Directory.GetFiles(fullPath, "*", SearchOption.AllDirectories)
-            .Where(f => !f.Contains(".git") && !f.Contains("node_modules"));
+        var files = EnumerateSearchFiles(fullPath)
+            .Where(file =>
+            {
+                if (string.IsNullOrWhiteSpace(glob))
+                {
+                    return true;
+                }
+
+                var relativePath = Path.GetRelativePath(fullPath, file).Replace('\\', '/');
+                return GlobMatches(relativePath, glob);
+            });
         
         var matches = new List<GrepMatch>();
+        var filesWithMatches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var totalMatches = 0;
         
         foreach (var file in files)
         {
             try
             {
                 var lines = File.ReadAllLines(file);
+                var relativePath = Path.GetRelativePath(fullPath, file).Replace('\\', '/');
                 for (var i = 0; i < lines.Length; i++)
                 {
                     if (regex.IsMatch(lines[i]))
                     {
-                        matches.Add(new GrepMatch(
-                            Path.GetRelativePath(fullPath, file),
-                            i + 1,
-                            lines[i].Trim()
-                        ));
+                        totalMatches++;
+                        filesWithMatches.Add(relativePath);
+                        if (matches.Count < limit)
+                        {
+                            matches.Add(new GrepMatch(
+                                relativePath,
+                                i + 1,
+                                lines[i].Trim()
+                            ));
+                        }
                     }
                 }
             }
@@ -209,8 +238,88 @@ public class ToolExecutor : IToolExecutor
             }
         }
         
-        return JsonSerializer.Serialize(new { pattern, matches });
+        return JsonSerializer.Serialize(new
+        {
+            pattern,
+            glob,
+            caseInsensitive,
+            totalMatches,
+            filesWithMatches = filesWithMatches.Count,
+            matches,
+            truncated = totalMatches > matches.Count
+        });
     }
+
+    private IEnumerable<string> EnumerateSearchFiles(string rootPath)
+    {
+        if (!Directory.Exists(rootPath))
+        {
+            yield break;
+        }
+
+        var pending = new Stack<string>();
+        pending.Push(rootPath);
+
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+
+            IEnumerable<string> directories;
+            try
+            {
+                directories = Directory.EnumerateDirectories(current);
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var directory in directories)
+            {
+                if (ShouldSkipSearchDirectory(directory))
+                {
+                    continue;
+                }
+
+                pending.Push(directory);
+            }
+
+            IEnumerable<string> files;
+            try
+            {
+                files = Directory.EnumerateFiles(current);
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var file in files)
+            {
+                if (ShouldIgnoreSearchFile(file))
+                {
+                    continue;
+                }
+
+                yield return file;
+            }
+        }
+    }
+
+    private bool ShouldSkipSearchDirectory(string path)
+    {
+        var name = Path.GetFileName(path);
+        return name.Equals(".git", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("node_modules", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals(".idea", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals(".vs", StringComparison.OrdinalIgnoreCase) ||
+               _gitIgnoreMatcher.IsIgnored(path, isDirectory: true);
+    }
+
+    private bool ShouldIgnoreSearchFile(string path) =>
+        _gitIgnoreMatcher.IsIgnored(path, isDirectory: false);
     
     private async Task<string> ExecuteWebFetchAsync(JsonElement input, CancellationToken cancellationToken)
     {
@@ -399,3 +508,170 @@ public class ToolExecutor : IToolExecutor
 
 internal record GrepMatch(string File, int Line, string Content);
 internal record TodoItem(string Content, string ActiveForm, string Status);
+
+internal sealed class GitIgnoreMatcher
+{
+    private readonly string _rootPath;
+    private readonly IReadOnlyList<GitIgnorePattern> _patterns;
+
+    private GitIgnoreMatcher(string rootPath, IReadOnlyList<GitIgnorePattern> patterns)
+    {
+        _rootPath = Path.GetFullPath(rootPath);
+        _patterns = patterns;
+    }
+
+    public static GitIgnoreMatcher Load(string rootPath)
+    {
+        var gitIgnorePath = Path.Combine(rootPath, ".gitignore");
+        if (!File.Exists(gitIgnorePath))
+        {
+            return new GitIgnoreMatcher(rootPath, []);
+        }
+
+        try
+        {
+            var patterns = File.ReadAllLines(gitIgnorePath)
+                .Select(GitIgnorePattern.Parse)
+                .Where(static pattern => pattern is not null)
+                .Cast<GitIgnorePattern>()
+                .ToList();
+
+            return new GitIgnoreMatcher(rootPath, patterns);
+        }
+        catch
+        {
+            return new GitIgnoreMatcher(rootPath, []);
+        }
+    }
+
+    public bool IsIgnored(string absolutePath, bool isDirectory)
+    {
+        if (_patterns.Count == 0)
+        {
+            return false;
+        }
+
+        var fullPath = Path.GetFullPath(absolutePath);
+        if (!IsUnderRoot(fullPath))
+        {
+            return false;
+        }
+
+        var relativePath = Path.GetRelativePath(_rootPath, fullPath).Replace('\\', '/');
+        if (relativePath.StartsWith("../", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var ignored = false;
+        foreach (var pattern in _patterns)
+        {
+            if (!pattern.Matches(relativePath, isDirectory))
+            {
+                continue;
+            }
+
+            ignored = !pattern.Negated;
+        }
+
+        return ignored;
+    }
+
+    private bool IsUnderRoot(string fullPath)
+    {
+        if (string.Equals(fullPath, _rootPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var prefix = _rootPath.EndsWith(Path.DirectorySeparatorChar) || _rootPath.EndsWith(Path.AltDirectorySeparatorChar)
+            ? _rootPath
+            : _rootPath + Path.DirectorySeparatorChar;
+
+        return fullPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+internal sealed class GitIgnorePattern
+{
+    private readonly Regex _regex;
+
+    private GitIgnorePattern(bool negated, bool directoryOnly, Regex regex)
+    {
+        Negated = negated;
+        DirectoryOnly = directoryOnly;
+        _regex = regex;
+    }
+
+    public bool Negated { get; }
+    public bool DirectoryOnly { get; }
+
+    public static GitIgnorePattern? Parse(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return null;
+        }
+
+        var trimmed = line.Trim();
+        if (trimmed.StartsWith('#'))
+        {
+            return null;
+        }
+
+        var negated = trimmed.StartsWith('!');
+        if (negated)
+        {
+            trimmed = trimmed[1..];
+        }
+
+        var directoryOnly = trimmed.EndsWith('/');
+        if (directoryOnly)
+        {
+            trimmed = trimmed[..^1];
+        }
+
+        trimmed = trimmed.TrimStart('/').Replace('\\', '/');
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            return null;
+        }
+
+        var hasSlash = trimmed.Contains('/');
+        var regexBody = BuildRegexBody(trimmed);
+        var regexPattern = hasSlash
+            ? $"^{regexBody}$"
+            : $"(^|.*/){regexBody}$";
+
+        if (directoryOnly)
+        {
+            regexPattern = hasSlash
+                ? $"^{regexBody}(/.*)?$"
+                : $"(^|.*/){regexBody}(/.*)?$";
+        }
+
+        return new GitIgnorePattern(
+            negated,
+            directoryOnly,
+            new Regex(regexPattern, RegexOptions.IgnoreCase | RegexOptions.Compiled)
+        );
+    }
+
+    public bool Matches(string relativePath, bool isDirectory)
+    {
+        if (DirectoryOnly && !isDirectory)
+        {
+            return false;
+        }
+
+        return _regex.IsMatch(relativePath);
+    }
+
+    private static string BuildRegexBody(string pattern) =>
+        Regex.Escape(pattern)
+            .Replace(@"\*\*/", @"(?:.*/)?")
+            .Replace(@"/\*\*", @"(?:/.*)?")
+            .Replace(@"\*\*", @".*")
+            .Replace(@"\*", @"[^/]*")
+            .Replace(@"\?", @"[^/]");
+}

@@ -10,6 +10,7 @@ namespace CodeSharp.Cli;
 internal sealed record TurnExecutionResult(TurnSummary? Summary, string? Error, bool Interrupted);
 internal enum ActivityLineStatus
 {
+    Info,
     Running,
     Success,
     Error,
@@ -41,6 +42,14 @@ internal sealed class TurnActivityState
         {
             switch (activity)
             {
+                case RuntimeActivity.AssistantPlan plan:
+                    _lines.Add(new ActivityLine(
+                        $"assistant-plan-{_lines.Count + 1}",
+                        "assistant_plan",
+                        plan.Text,
+                        ActivityLineStatus.Info
+                    ));
+                    break;
                 case RuntimeActivity.ToolStarted started:
                     _lines.Add(new ActivityLine(
                         started.ToolUseId,
@@ -654,6 +663,7 @@ Add any additional context about the project.
 
     internal static string FormatActivityLine(ActivityLine line) => line.Status switch
     {
+        ActivityLineStatus.Info => ConsoleUi.AssistantPlan(line.Description),
         ActivityLineStatus.Running => $"⋯ {line.Description}",
         ActivityLineStatus.Success => $"{ConsoleUi.Success("✓")} {line.Description}",
         ActivityLineStatus.Error => $"{ConsoleUi.Error("✗")} {line.Description}",
@@ -967,6 +977,18 @@ Permission Mode: {permissionMode.AsString()}",
 {string.Join("\n", toolLines)}
 
 Respect the tool surface exactly. Do not invent unavailable tools. Prefer read-only tools for analysis before using mutating tools. For write operations, make focused edits and avoid unrelated changes.",
+            @"Tool usage guidance
+- Before using tools, say in one concise sentence what you are about to inspect, search, or change.
+- For repository exploration, start with grep_search or glob_search before calling read_file on many files.
+- Use glob_search to narrow candidate files by name or path pattern.
+- Use grep_search to find placeholders, TODOs, 'not implemented', specific symbols, or feature flags across the repo.
+- After search narrows the candidate set, use read_file on the few most relevant files.
+- Avoid shotgun-reading many files just to discover where a feature lives.",
+            @"Search and verification rules
+- Do not claim that something is absent from the codebase unless the relevant search result actually returned zero matches.
+- For broad repo questions, prefer at least one broad search and one targeted follow-up search before concluding nothing was found.
+- When reporting search results, mention what patterns you searched for and whether the result was truncated or sampled.
+- If search finds matches, summarize the concrete files or categories instead of answering as if nothing was found.",
             @"Output style guidelines
 - Be concise, direct, and technically precise.
 - Prefer actionable answers over long preambles.

@@ -90,6 +90,11 @@ public class ConversationRuntime
             
             _session.AddMessage(assistantMessage);
             assistantMessages.Add(assistantMessage);
+
+            if (pendingToolUses.Count > 0 && BuildAssistantPlanPreview(assistantMessage, pendingToolUses) is { } planPreview)
+            {
+                activitySink?.Invoke(new RuntimeActivity.AssistantPlan(planPreview));
+            }
             
             if (pendingToolUses.Count == 0)
             {
@@ -287,6 +292,73 @@ public class ConversationRuntime
         }
 
         parallelBatch.Clear();
+    }
+
+    private static string? BuildAssistantPlanPreview(
+        ConversationMessage message,
+        IReadOnlyList<(string ToolUseId, string ToolName, string Input)> pendingToolUses
+    )
+    {
+        var text = string.Join(
+            "\n",
+            message.Blocks
+                .OfType<ContentBlock.Text>()
+                .Select(block => block.Content.Trim())
+                .Where(static content => !string.IsNullOrWhiteSpace(content))
+        ).Trim();
+
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return BuildToolPlanFallback(pendingToolUses);
+        }
+
+        var singleLine = text.Replace("\r\n", " ").Replace('\n', ' ').Trim();
+        if (string.IsNullOrWhiteSpace(singleLine))
+        {
+            return BuildToolPlanFallback(pendingToolUses);
+        }
+
+        var firstSentenceEnd = singleLine.IndexOfAny(['.', '!', '?']);
+        var preview = firstSentenceEnd >= 0
+            ? singleLine[..(firstSentenceEnd + 1)]
+            : singleLine;
+
+        const int maxLength = 120;
+        var normalized = preview.Length <= maxLength
+            ? preview
+            : $"{preview[..(maxLength - 1)]}…";
+
+        if (!string.IsNullOrWhiteSpace(normalized))
+        {
+            return normalized;
+        }
+
+        return BuildToolPlanFallback(pendingToolUses);
+    }
+
+    private static string BuildToolPlanFallback(
+        IReadOnlyList<(string ToolUseId, string ToolName, string Input)> pendingToolUses
+    )
+    {
+        var toolNames = pendingToolUses.Select(static tool => tool.ToolName).ToList();
+        if (toolNames.All(static name => name == "read_file"))
+        {
+            return toolNames.Count == 1
+                ? "I'm opening the most relevant file first."
+                : $"I'm opening {toolNames.Count} relevant files to inspect the implementation.";
+        }
+
+        if (toolNames.All(static name => name == "glob_search"))
+        {
+            return "I'm locating candidate files first.";
+        }
+
+        if (toolNames.All(static name => name == "grep_search"))
+        {
+            return "I'm searching the codebase for the relevant symbols and placeholders first.";
+        }
+
+        return "I'm gathering the relevant code context first.";
     }
     
     private static (ConversationMessage Message, TokenUsage? Usage) BuildAssistantMessage(

@@ -18,6 +18,8 @@ internal static class ConsoleUi
 
     public static string Accent(string text) => Paint(text, "38;5;45");
 
+    public static string AccentBadge(string text) => Paint(text, "1;30;48;5;45");
+
     public static string Muted(string text) => Paint(text, "2;37");
 
     public static string Strong(string text) => Paint(text, "1");
@@ -41,6 +43,8 @@ internal static class ConsoleUi
     public static string Warning(string text) => Paint(text, "38;5;214");
 
     public static string Error(string text) => Paint(text, "38;5;203");
+
+    public static string AssistantPlan(string text) => $"{AccentBadge(" NEXT ")} {Strong(text)}";
 
     public static string Panel(
         string title,

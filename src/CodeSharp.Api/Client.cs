@@ -82,13 +82,14 @@ public class ProviderClient
         "haiku" => "claude-haiku-4-5-20251213",
         "grok" => "grok-3",
         "grok-mini" => "grok-3-mini",
+        "glm5" => "z-ai/glm5",
         _ => model
     };
 
     public static ProviderKind DetectProviderKind(string model) => model.ToLowerInvariant() switch
     {
         var m when m.StartsWith("grok") => ProviderKind.Xai,
-        var m when m.StartsWith("kimi") || m.Contains("moonshotai") => ProviderKind.Nvidia,
+        var m when m.StartsWith("kimi") || m.Contains("moonshotai") || m.StartsWith("z-ai/") => ProviderKind.Nvidia,
         _ => ProviderKind.CodeSharpApi
     };
 }

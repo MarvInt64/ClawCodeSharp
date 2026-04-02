@@ -1,6 +1,6 @@
-src/Claw.Api/obj
+src/CodeSharp.Api/obj
 .DS_Store
-src/Claw.Api/bin
+src/CodeSharp.Api/bin
 obj/
 bin/
 .idea

@@ -168,7 +168,7 @@ public class GlobalToolRegistry
             },
             PermissionMode.DangerFullAccess
         ),
-        new("read_file", "Read a text file from the workspace.",
+        new("read_file", "Read a known text file from the workspace. Prefer glob_search or grep_search first when the target file is not already known.",
             new
             {
                 type = "object",
@@ -213,21 +213,22 @@ public class GlobalToolRegistry
             },
             PermissionMode.WorkspaceWrite
         ),
-        new("glob_search", "Find files by glob pattern.",
+        new("glob_search", "Find candidate files by glob pattern. Use this to narrow down file paths before calling read_file. The result includes a total count plus matching paths.",
             new
             {
                 type = "object",
                 properties = new
                 {
                     pattern = new { type = "string" },
-                    path = new { type = "string" }
+                    path = new { type = "string" },
+                    limit = new { type = "integer", minimum = 1 }
                 },
                 required = new[] { "pattern" },
                 additionalProperties = false
             },
             PermissionMode.ReadOnly
         ),
-        new("grep_search", "Search file contents with a regex pattern.",
+        new("grep_search", "Search file contents with a regex pattern. Use this before read_file when you need to find symbols, TODOs, placeholders, or unimplemented features. The result includes total match counts and a capped sample of matching lines.",
             new
             {
                 type = "object",
@@ -236,6 +237,7 @@ public class GlobalToolRegistry
                     pattern = new { type = "string" },
                     path = new { type = "string" },
                     glob = new { type = "string" },
+                    limit = new { type = "integer", minimum = 1 },
                     output_mode = new { type = "string" },
                     @n = new { type = "boolean" },
                     @i = new { type = "boolean" }

@@ -35,6 +35,7 @@ internal sealed class ReplConsole
     private readonly object _gate = new();
     private bool _busyVisible;
     private int _busyRenderLines;
+    private int _idleRenderLines;
     private int _spinnerIndex;
     private string _busyLabel = "Thinking";
     private IReadOnlyList<string> _queuedPreview = [];
@@ -66,7 +67,7 @@ internal sealed class ReplConsole
         lock (_gate)
         {
             _busyVisible = false;
-            Console.Write($"\r\u001b[2K{_prompt}{_draft}");
+            RenderIdleLocked();
         }
     }
 
@@ -88,33 +89,38 @@ internal sealed class ReplConsole
     {
         lock (_gate)
         {
+            if (key.Key == ConsoleKey.Tab || key.KeyChar == '\t')
+            {
+                ApplySlashCompletionLocked();
+            }
+            else
             switch (key.Key)
             {
                 case ConsoleKey.Enter:
                 {
-                    var submitted = _draft.ToString().Trim();
-                    _draft.Clear();
-                    ResetCompletionStateLocked();
+                    var draftText = _draft.ToString();
+                    var submitted = draftText.Trim();
 
                     if (!busy)
                     {
-                        Console.WriteLine();
+                        ClearIdleBlockLocked();
+                        Console.WriteLine(
+                            string.IsNullOrWhiteSpace(draftText)
+                                ? string.Empty
+                                : $"{_prompt}{draftText}"
+                        );
                     }
+
+                    _draft.Clear();
+                    ResetCompletionStateLocked();
 
                     if (busy)
                     {
                         RenderBusyFrameLocked();
                     }
-                    else
-                    {
-                        RenderIdleLocked();
-                    }
 
                     return string.IsNullOrEmpty(submitted) ? null : new PromptSubmission(submitted);
                 }
-                case ConsoleKey.Tab:
-                    ApplySlashCompletionLocked();
-                    break;
                 case ConsoleKey.Backspace:
                     if (_draft.Length > 0)
                     {
@@ -150,19 +156,20 @@ internal sealed class ReplConsole
 
     private void ApplySlashCompletionLocked()
     {
-        var draft = _draft.ToString();
-        if (!draft.StartsWith("/", StringComparison.Ordinal))
+        var currentToken = GetCurrentSlashTokenLocked();
+        if (currentToken is null)
         {
+            ResetCompletionStateLocked();
             return;
         }
 
-        var firstSpace = draft.IndexOf(' ');
-        if (firstSpace >= 0)
+        var matches = FindSlashMatchesLocked(currentToken);
+        if (matches.Count == 0)
         {
+            ResetCompletionStateLocked();
             return;
         }
 
-        var currentToken = draft.TrimEnd();
         if (_completionMatches.Count > 0 &&
             _completionMatches.Contains(currentToken, StringComparer.OrdinalIgnoreCase))
         {
@@ -171,17 +178,15 @@ internal sealed class ReplConsole
             return;
         }
 
-        var matches = _slashCommands
-            .Where(cmd => cmd.StartsWith(currentToken, StringComparison.OrdinalIgnoreCase))
-            .ToList();
-
-        if (matches.Count == 0)
+        var sharedPrefix = LongestCommonPrefix(matches);
+        _completionMatches = matches;
+        _completionIndex = 0;
+        if (sharedPrefix.Length > currentToken.Length)
         {
+            ReplaceDraftWithCompletionLocked(sharedPrefix, appendSpace: matches.Count == 1);
             return;
         }
 
-        _completionMatches = matches;
-        _completionIndex = 0;
         ReplaceDraftWithCompletionLocked(matches[0], appendSpace: matches.Count == 1);
     }
 
@@ -201,6 +206,94 @@ internal sealed class ReplConsole
         _completionIndex = -1;
     }
 
+    private string BuildPromptLineLocked()
+    {
+        var draft = _draft.ToString();
+        var hint = BuildCompletionHintLocked();
+        return string.IsNullOrEmpty(hint)
+            ? $"{_prompt}{draft}"
+            : $"{_prompt}{draft}{hint}";
+    }
+
+    private string BuildCompletionHintLocked()
+    {
+        var currentToken = GetCurrentSlashTokenLocked();
+        if (currentToken is null)
+        {
+            return string.Empty;
+        }
+
+        var matches = FindSlashMatchesLocked(currentToken);
+        if (matches.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        if (matches.Count == 1)
+        {
+            var match = matches[0];
+            if (match.Length <= currentToken.Length)
+            {
+                return ConsoleUi.Muted(" ");
+            }
+
+            return ConsoleUi.Muted(match[currentToken.Length..]);
+        }
+
+        return string.Empty;
+    }
+
+    private List<string> FindSlashMatchesLocked(string currentToken) =>
+        _slashCommands
+            .Where(cmd => cmd.StartsWith(currentToken, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+    private string? GetCurrentSlashTokenLocked()
+    {
+        var draft = _draft.ToString();
+        if (!draft.StartsWith("/", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var firstSpace = draft.IndexOf(' ');
+        if (firstSpace >= 0)
+        {
+            return draft[..firstSpace];
+        }
+
+        return draft.TrimEnd();
+    }
+
+    private static string LongestCommonPrefix(IReadOnlyList<string> values)
+    {
+        if (values.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var prefix = values[0];
+        for (var i = 1; i < values.Count; i++)
+        {
+            var other = values[i];
+            var length = 0;
+            var maxLength = Math.Min(prefix.Length, other.Length);
+            while (length < maxLength &&
+                   char.ToLowerInvariant(prefix[length]) == char.ToLowerInvariant(other[length]))
+            {
+                length++;
+            }
+
+            prefix = prefix[..length];
+            if (prefix.Length == 0)
+            {
+                break;
+            }
+        }
+
+        return prefix;
+    }
+
     public void EnterBusy(
         string label,
         IEnumerable<string> queuedInputs,
@@ -216,6 +309,7 @@ internal sealed class ReplConsole
                 _busyVisible = true;
             }
 
+            ClearIdleBlockLocked();
             _queuedPreview = SnapshotQueuedInputs(queuedInputs);
             _activityPreview = SnapshotActivityLines(activityLines);
             RenderBusyFrameLocked();
@@ -283,7 +377,7 @@ internal sealed class ReplConsole
         var lines = new List<string> { BuildStatus(_busyLabel) };
         lines.AddRange(_activityPreview.Select(line => $"  {line}"));
         lines.AddRange(_queuedPreview.Select((message, index) => $"  {index + 1}. {message}"));
-        lines.Add($"{_prompt}{_draft}");
+        lines.Add(BuildPromptLineLocked());
 
         ClearBusyBlockLocked();
         WriteBlockLocked(lines);
@@ -292,34 +386,49 @@ internal sealed class ReplConsole
 
     private void RenderIdleLocked()
     {
-        Console.Write($"\r\u001b[2K{_prompt}{_draft}");
+        var lines = BuildIdleLinesLocked();
+        ClearIdleBlockLocked();
+        WriteBlockLocked(lines);
+        _idleRenderLines = lines.Count;
     }
 
     private void ClearBusyBlockLocked()
     {
-        if (_busyRenderLines == 0)
+        ClearRenderedBlockLocked(_busyRenderLines);
+        _busyRenderLines = 0;
+    }
+
+    private void ClearIdleBlockLocked()
+    {
+        ClearRenderedBlockLocked(_idleRenderLines);
+        _idleRenderLines = 0;
+    }
+
+    private static void ClearRenderedBlockLocked(int lineCount)
+    {
+        if (lineCount == 0)
         {
             Console.Write("\r\u001b[2K");
             return;
         }
 
-        if (_busyRenderLines > 1)
+        if (lineCount > 1)
         {
-            Console.Write($"\u001b[{_busyRenderLines - 1}A");
+            Console.Write($"\u001b[{lineCount - 1}A");
         }
 
-        for (var i = 0; i < _busyRenderLines; i++)
+        for (var i = 0; i < lineCount; i++)
         {
             Console.Write("\r\u001b[2K");
-            if (i < _busyRenderLines - 1)
+            if (i < lineCount - 1)
             {
                 Console.Write('\n');
             }
         }
 
-        if (_busyRenderLines > 1)
+        if (lineCount > 1)
         {
-            Console.Write($"\u001b[{_busyRenderLines - 1}A");
+            Console.Write($"\u001b[{lineCount - 1}A");
         }
     }
 
@@ -334,6 +443,44 @@ internal sealed class ReplConsole
                 Console.Write('\n');
             }
         }
+    }
+
+    private List<string> BuildIdleLinesLocked()
+    {
+        var lines = new List<string>();
+        lines.AddRange(BuildSuggestionLinesLocked());
+        lines.Add(BuildPromptLineLocked());
+        return lines;
+    }
+
+    private IReadOnlyList<string> BuildSuggestionLinesLocked()
+    {
+        var currentToken = GetCurrentSlashTokenLocked();
+        if (currentToken is null)
+        {
+            return [];
+        }
+
+        var matches = FindSlashMatchesLocked(currentToken);
+        if (matches.Count == 0)
+        {
+            return [];
+        }
+
+        var lines = new List<string>();
+        var visibleMatches = matches.Take(6).ToList();
+        for (var i = 0; i < visibleMatches.Count; i++)
+        {
+            var prefix = i == 0 ? ConsoleUi.Accent("  › ") : "    ";
+            lines.Add($"{prefix}{visibleMatches[i]}");
+        }
+
+        if (matches.Count > visibleMatches.Count)
+        {
+            lines.Add(ConsoleUi.Muted($"    +{matches.Count - visibleMatches.Count} more"));
+        }
+
+        return lines;
     }
 
     private static IReadOnlyList<string> SnapshotQueuedInputs(IEnumerable<string> queuedInputs) =>

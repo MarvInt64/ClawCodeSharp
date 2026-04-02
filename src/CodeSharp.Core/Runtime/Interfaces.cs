@@ -25,6 +25,8 @@ public record TurnSummary(
 
 public abstract record RuntimeActivity
 {
+    public sealed record AssistantPlan(string Text) : RuntimeActivity;
+
     public sealed record ToolStarted(string ToolUseId, string ToolName, string Input) : RuntimeActivity;
 
     public sealed record ToolFinished(string ToolUseId, string ToolName, bool IsError) : RuntimeActivity;

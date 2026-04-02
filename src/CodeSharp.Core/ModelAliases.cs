@@ -10,6 +10,7 @@ public static class ModelAliases
         "opus" => "claude-opus-4-6",
         "sonnet" => "claude-sonnet-4-6",
         "haiku" => "claude-haiku-4-5-20251213",
+        "glm5" => "z-ai/glm5",
         _ => model
     };
     
