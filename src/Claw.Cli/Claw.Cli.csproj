@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <LangVersion>preview</LangVersion>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>claw</ToolCommandName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Claw.Core\Claw.Core.csproj" />
+    <ProjectReference Include="..\Claw.Api\Claw.Api.csproj" />
+    <ProjectReference Include="..\Claw.Tools\Claw.Tools.csproj" />
+    <ProjectReference Include="..\Claw.Plugins\Claw.Plugins.csproj" />
+    <ProjectReference Include="..\Claw.Lsp\Claw.Lsp.csproj" />
+    <ProjectReference Include="..\Claw.Commands\Claw.Commands.csproj" />
+  </ItemGroup>
+</Project>

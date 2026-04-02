@@ -1,0 +1,5 @@
+src/Claw.Api/obj
+.DS_Store
+src/Claw.Api/bin
+obj/
+bin/
