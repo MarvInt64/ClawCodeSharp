@@ -22,7 +22,8 @@ internal sealed record ActivityLine(
     string ToolName,
     string Description,
     ActivityLineStatus Status,
-    string? Detail = null
+    string? Detail = null,
+    IReadOnlyList<string>? DetailLines = null
 );
 
 internal sealed record ActiveTurn(
@@ -64,9 +65,17 @@ internal sealed class TurnActivityState
                     if (index >= 0)
                     {
                         var existing = _lines[index];
+                        var description = Program.DescribeToolFinish(
+                            finished.ToolName,
+                            finished.Output,
+                            existing.Description,
+                            finished.IsError
+                        );
                         _lines[index] = existing with
                         {
-                            Status = finished.IsError ? ActivityLineStatus.Error : ActivityLineStatus.Success
+                            Description = description,
+                            Status = finished.IsError ? ActivityLineStatus.Error : ActivityLineStatus.Success,
+                            DetailLines = Program.ExtractToolPreviewLines(finished.ToolName, finished.Output)
                         };
                     }
                     else
@@ -74,8 +83,14 @@ internal sealed class TurnActivityState
                         _lines.Add(new ActivityLine(
                             finished.ToolUseId,
                             finished.ToolName,
-                            finished.ToolName,
-                            finished.IsError ? ActivityLineStatus.Error : ActivityLineStatus.Success
+                            Program.DescribeToolFinish(
+                                finished.ToolName,
+                                finished.Output,
+                                finished.ToolName,
+                                finished.IsError
+                            ),
+                            finished.IsError ? ActivityLineStatus.Error : ActivityLineStatus.Success,
+                            DetailLines: Program.ExtractToolPreviewLines(finished.ToolName, finished.Output)
                         ));
                     }
                     break;
@@ -105,11 +120,6 @@ internal sealed class TurnActivityState
                     break;
                 }
             }
-
-            while (_lines.Count > 6)
-            {
-                _lines.RemoveAt(0);
-            }
         }
     }
 
@@ -117,7 +127,7 @@ internal sealed class TurnActivityState
     {
         lock (_gate)
         {
-            return _lines.Select(Program.FormatActivityLine).ToList();
+            return _lines.SelectMany(Program.FormatActivityLines).ToList();
         }
     }
 
@@ -658,15 +668,48 @@ Add any additional context about the project.
         _ => provider.ToString().ToLowerInvariant()
     };
 
-    internal static string FormatActivityLine(ActivityLine line) => line.Status switch
+    internal static IReadOnlyList<string> FormatActivityLines(ActivityLine line)
     {
-        ActivityLineStatus.Info => ConsoleUi.AssistantPlan(line.Description),
-        ActivityLineStatus.Running => $"⋯ {line.Description}",
-        ActivityLineStatus.Success => $"{ConsoleUi.Success("✓")} {line.Description}",
-        ActivityLineStatus.Error => $"{ConsoleUi.Error("✗")} {line.Description}",
-        ActivityLineStatus.Blocked => $"! {line.Description} ({line.Detail ?? "blocked"})",
-        _ => line.Description
-    };
+        var lines = new List<string>
+        {
+            line.Status switch
+            {
+                ActivityLineStatus.Info => ConsoleUi.AssistantPlan(line.Description),
+                ActivityLineStatus.Running => $"⋯ {line.Description}",
+                ActivityLineStatus.Success => $"{ConsoleUi.Success("✓")} {line.Description}",
+                ActivityLineStatus.Error => $"{ConsoleUi.Error("✗")} {line.Description}",
+                ActivityLineStatus.Blocked => $"! {line.Description} ({line.Detail ?? "blocked"})",
+                _ => line.Description
+            }
+        };
+
+        if (line.DetailLines is not null)
+        {
+            lines.AddRange(line.DetailLines.Select(FormatActivityDetailLine));
+        }
+
+        return lines;
+    }
+
+    private static string FormatActivityDetailLine(string line)
+    {
+        if (line.StartsWith("@@", StringComparison.Ordinal))
+        {
+            return $"    {ConsoleUi.DiffHunk(line)}";
+        }
+
+        if (line.StartsWith("+", StringComparison.Ordinal))
+        {
+            return $"    {ConsoleUi.DiffAdded(line)}";
+        }
+
+        if (line.StartsWith("-", StringComparison.Ordinal))
+        {
+            return $"    {ConsoleUi.DiffRemoved(line)}";
+        }
+
+        return $"    {ConsoleUi.Muted(line)}";
+    }
 
     internal static string DescribeToolStart(string toolName, string input)
     {
@@ -695,6 +738,99 @@ Add any additional context about the project.
                 ? $"{toolName} {Truncate(payload.Value.ToString(), 56)}"
                 : toolName
         };
+    }
+
+    internal static string DescribeToolFinish(string toolName, string output, string fallbackDescription, bool isError)
+    {
+        JsonElement? payload = null;
+        try
+        {
+            payload = JsonSerializer.Deserialize<JsonElement>(output);
+        }
+        catch
+        {
+        }
+
+        var path = JsonString(payload, "path") ?? ExtractPathFromActivityDescription(fallbackDescription) ?? "file";
+
+        return toolName switch
+        {
+            "write_file" => isError ? $"failed writing {path}" : $"wrote {path}",
+            "edit_file" => isError ? $"failed editing {path}" : $"edited {path}",
+            _ => fallbackDescription
+        };
+    }
+
+    internal static IReadOnlyList<string>? ExtractToolPreviewLines(string toolName, string output)
+    {
+        if (toolName is not ("write_file" or "edit_file"))
+        {
+            return null;
+        }
+
+        JsonElement? payload = null;
+        try
+        {
+            payload = JsonSerializer.Deserialize<JsonElement>(output);
+        }
+        catch
+        {
+            return string.IsNullOrWhiteSpace(output)
+                ? null
+                : WrapToolDetailText(output);
+        }
+
+        if (payload is not { ValueKind: JsonValueKind.Object } json ||
+            !json.TryGetProperty("preview", out var preview) ||
+            preview.ValueKind != JsonValueKind.Array)
+        {
+            return string.IsNullOrWhiteSpace(output)
+                ? null
+                : WrapToolDetailText(output);
+        }
+
+        var lines = preview.EnumerateArray()
+            .Where(static item => item.ValueKind == JsonValueKind.String)
+            .Select(static item => item.GetString() ?? string.Empty)
+            .Where(static line => !string.IsNullOrWhiteSpace(line))
+            .ToList();
+
+        if (json.TryGetProperty("previewTruncated", out var truncated) &&
+            truncated.ValueKind == JsonValueKind.True)
+        {
+            lines.Add("... diff preview truncated");
+        }
+
+        return lines.Count == 0 ? null : lines;
+    }
+
+    private static string? ExtractPathFromActivityDescription(string description)
+    {
+        var prefixes = new[] { "editing ", "writing ", "reading ", "failed editing ", "failed writing " };
+        foreach (var prefix in prefixes)
+        {
+            if (description.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return description[prefix.Length..];
+            }
+        }
+
+        return null;
+    }
+
+    private static IReadOnlyList<string> WrapToolDetailText(string text)
+    {
+        var normalized = text.Replace("\r\n", "\n").Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return [];
+        }
+
+        const int maxLength = 160;
+        return normalized
+            .Split('\n')
+            .Select(line => line.Length <= maxLength ? line : $"{line[..(maxLength - 1)]}…")
+            .ToList();
     }
 
     private static string? JsonString(JsonElement? payload, string propertyName)

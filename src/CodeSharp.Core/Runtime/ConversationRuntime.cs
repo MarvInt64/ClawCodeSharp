@@ -250,7 +250,7 @@ public class ConversationRuntime
     {
         activitySink?.Invoke(new RuntimeActivity.ToolStarted(toolUseId, toolName, input));
         var (output, isError) = await ExecuteToolWithErrorHandlingAsync(toolName, input, cancellationToken);
-        activitySink?.Invoke(new RuntimeActivity.ToolFinished(toolUseId, toolName, isError));
+        activitySink?.Invoke(new RuntimeActivity.ToolFinished(toolUseId, toolName, output, isError));
 
         output = MergeHookFeedback(preHookResult.Messages, output, false);
 

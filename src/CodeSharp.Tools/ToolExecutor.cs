@@ -121,11 +121,21 @@ public class ToolExecutor : IToolExecutor
         var content = input.GetProperty("content").GetString() ?? string.Empty;
         
         var fullPath = Path.GetFullPath(path, _workingDirectory);
+        var previousContent = File.Exists(fullPath)
+            ? await File.ReadAllTextAsync(fullPath, cancellationToken)
+            : null;
         Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
         
         await File.WriteAllTextAsync(fullPath, content, cancellationToken);
+        var preview = BuildDiffPreview(previousContent, content);
         
-        return JsonSerializer.Serialize(new { path, linesWritten = content.Split('\n').Length });
+        return JsonSerializer.Serialize(new
+        {
+            path,
+            linesWritten = content.Split('\n').Length,
+            preview = preview.Lines,
+            previewTruncated = preview.Truncated
+        });
     }
     
     private async Task<string> ExecuteEditFileAsync(JsonElement input, CancellationToken cancellationToken)
@@ -137,6 +147,7 @@ public class ToolExecutor : IToolExecutor
         
         var fullPath = Path.GetFullPath(path, _workingDirectory);
         var content = await File.ReadAllTextAsync(fullPath, cancellationToken);
+        var originalContent = content;
         
         if (replaceAll)
         {
@@ -151,8 +162,15 @@ public class ToolExecutor : IToolExecutor
         }
         
         await File.WriteAllTextAsync(fullPath, content, cancellationToken);
+        var preview = BuildDiffPreview(originalContent, content);
         
-        return JsonSerializer.Serialize(new { path, edited = true });
+        return JsonSerializer.Serialize(new
+        {
+            path,
+            edited = true,
+            preview = preview.Lines,
+            previewTruncated = preview.Truncated
+        });
     }
     
     private string ExecuteGlobSearch(JsonElement input)
@@ -504,10 +522,66 @@ public class ToolExecutor : IToolExecutor
 
         return Regex.IsMatch(input, $"^{regexPattern}$", RegexOptions.IgnoreCase);
     }
+
+    private static DiffPreview BuildDiffPreview(string? oldContent, string newContent, int maxPreviewLines = 12)
+    {
+        var oldLines = SplitLines(oldContent);
+        var newLines = SplitLines(newContent);
+
+        var prefix = 0;
+        while (prefix < oldLines.Length &&
+               prefix < newLines.Length &&
+               string.Equals(oldLines[prefix], newLines[prefix], StringComparison.Ordinal))
+        {
+            prefix++;
+        }
+
+        var oldSuffix = oldLines.Length - 1;
+        var newSuffix = newLines.Length - 1;
+        while (oldSuffix >= prefix &&
+               newSuffix >= prefix &&
+               string.Equals(oldLines[oldSuffix], newLines[newSuffix], StringComparison.Ordinal))
+        {
+            oldSuffix--;
+            newSuffix--;
+        }
+
+        var removed = oldSuffix >= prefix ? oldLines[prefix..(oldSuffix + 1)] : [];
+        var added = newSuffix >= prefix ? newLines[prefix..(newSuffix + 1)] : [];
+
+        if (removed.Length == 0 && added.Length == 0)
+        {
+            return new DiffPreview([], false);
+        }
+
+        var startLine = prefix + 1;
+        var previewLines = new List<string>
+        {
+            $"@@ -{startLine},{removed.Length} +{startLine},{added.Length} @@"
+        };
+
+        previewLines.AddRange(removed.Select(static line => $"- {line}"));
+        previewLines.AddRange(added.Select(static line => $"+ {line}"));
+
+        var truncated = false;
+        if (previewLines.Count > maxPreviewLines)
+        {
+            previewLines = [.. previewLines.Take(maxPreviewLines)];
+            truncated = true;
+        }
+
+        return new DiffPreview(previewLines, truncated);
+    }
+
+    private static string[] SplitLines(string? content) =>
+        string.IsNullOrEmpty(content)
+            ? []
+            : content.Replace("\r\n", "\n").Split('\n');
 }
 
 internal record GrepMatch(string File, int Line, string Content);
 internal record TodoItem(string Content, string ActiveForm, string Status);
+internal sealed record DiffPreview(IReadOnlyList<string> Lines, bool Truncated);
 
 internal sealed class GitIgnoreMatcher
 {

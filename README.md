@@ -2,6 +2,13 @@
 
 This is the C#/.NET 10 port of the original Rust implementation of Claw Code, now consistently branded as CodeSharp, with support for Anthropic, NVIDIA, OpenAI, and xAI providers plus an improved terminal UX.
 
+## Showcase
+
+<p>
+  <img src="assets/showcase/screen0.png" alt="CodeSharp REPL screenshot 1" width="49%" />
+  <img src="assets/showcase/screen1.png" alt="CodeSharp REPL screenshot 2" width="49%" />
+</p>
+
 ## Improvements
 
 The current C# CLI has already been improved in several practical areas:

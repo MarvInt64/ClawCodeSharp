@@ -413,12 +413,30 @@ internal sealed class ReplConsole
         }
 
         var lines = BuildContentLinesLocked();
-        lines.Add(BuildStatus(_busyLabel));
-        foreach (var activityLine in _activityPreview)
+        var wrappedActivityLines = _activityPreview
+            .SelectMany(activityLine => WrapDisplayLine(activityLine, "  ", "    "))
+            .ToList();
+        var queuedLines = BuildQueuedLinesLocked();
+        var fixedLineCount = lines.Count + queuedLines.Count + 1;
+        var availableActivityLines = Math.Max(0, GetAvailableBodyHeightLocked() - fixedLineCount);
+
+        if (wrappedActivityLines.Count > availableActivityLines)
         {
-            lines.AddRange(WrapDisplayLine(activityLine, "  ", "    "));
+            var hiddenCount = wrappedActivityLines.Count - availableActivityLines;
+            if (availableActivityLines > 0)
+            {
+                lines.Add(ConsoleUi.Muted($"  ... {hiddenCount} earlier activity lines hidden"));
+                availableActivityLines--;
+            }
+
+            lines.AddRange(wrappedActivityLines.TakeLast(availableActivityLines));
         }
-        lines.AddRange(_queuedPreview.Select((message, index) => $"  {index + 1}. {message}"));
+        else
+        {
+            lines.AddRange(wrappedActivityLines);
+        }
+        lines.AddRange(queuedLines);
+        lines.Add(BuildStatus(_busyLabel));
         lines.Add(BuildPromptLineLocked());
 
         RenderBodyLocked(lines);
@@ -446,6 +464,39 @@ internal sealed class ReplConsole
         }
 
         return lines;
+    }
+
+    private IReadOnlyList<string> BuildQueuedLinesLocked()
+    {
+        if (_queuedPreview.Count == 0)
+        {
+            return [];
+        }
+
+        var lines = new List<string>
+        {
+            ConsoleUi.Muted($"  queued next: {_queuedPreview[0]}")
+        };
+
+        if (_queuedPreview.Count > 1)
+        {
+            lines.Add(ConsoleUi.Muted($"  +{_queuedPreview.Count - 1} more queued"));
+        }
+
+        return lines;
+    }
+
+    private int GetAvailableBodyHeightLocked()
+    {
+        try
+        {
+            var headerHeight = _headerLines.Count + (_headerLines.Count > 0 ? 1 : 0);
+            return Math.Max(8, Console.WindowHeight - headerHeight);
+        }
+        catch
+        {
+            return 24;
+        }
     }
 
     private static void ClearRenderedBlockLocked(int lineCount)
@@ -538,7 +589,7 @@ internal sealed class ReplConsole
     private static string PreviewQueuedMessage(string input)
     {
         var singleLine = input.Replace("\r\n", " ").Replace('\n', ' ').Trim();
-        const int maxLength = 72;
+        const int maxLength = 56;
         if (singleLine.Length <= maxLength)
         {
             return singleLine;
