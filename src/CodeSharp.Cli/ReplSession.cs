@@ -12,6 +12,7 @@ public class ReplSession
     private readonly CommandRegistry _commandRegistry;
     private readonly UsageTracker _usageTracker;
     private readonly string _sessionPath;
+    private readonly GlobalSettingsStore _globalSettingsStore;
     
     public ReplSession(
         ConversationRuntime runtime,
@@ -28,6 +29,7 @@ public class ReplSession
         _commandRegistry = new CommandRegistry();
         _usageTracker = runtime.Usage;
         _sessionPath = sessionPath;
+        _globalSettingsStore = new GlobalSettingsStore();
     }
     
     public ConversationRuntime Runtime => _runtime;
@@ -35,6 +37,7 @@ public class ReplSession
     public PermissionMode PermissionMode => _permissionMode;
     public UsageTracker Usage => _usageTracker;
     public string SessionPath => _sessionPath;
+    public IEnumerable<string> CompletionCandidates => _commandRegistry.GetCompletionCandidates();
     
     public string StartupBanner()
     {
@@ -53,7 +56,7 @@ public class ReplSession
                 ("Permissions", _permissionMode.AsString()),
                 ("Session", Path.GetFileNameWithoutExtension(_sessionPath))
             ],
-            "/help · /status · type while thinking to queue · Ctrl+C cancels · Ctrl+C twice asks to quit"
+            "/help · /config · /status · type while thinking to queue · Ctrl+C cancels · Ctrl+C twice asks to quit"
         );
     }
     
@@ -122,8 +125,14 @@ public class ReplSession
                 return false;
                 
             case SlashCommandKind.Config:
-                Console.WriteLine(ConsoleUi.MessageBlock("config", "Config inspection is not implemented yet."));
+            {
+                var result = ConfigCommandProcessor.Process(command.Section, _globalSettingsStore);
+                var footer = string.IsNullOrWhiteSpace(command.Section)
+                    ? "Global defaults apply to new CodeSharp sessions."
+                    : result.Footer;
+                Console.WriteLine(ConsoleUi.MessageBlock(result.Title, result.Body, footer));
                 return false;
+            }
                 
             case SlashCommandKind.Memory:
                 Console.WriteLine(ConsoleUi.MessageBlock("memory", "Memory inspection is not implemented yet."));

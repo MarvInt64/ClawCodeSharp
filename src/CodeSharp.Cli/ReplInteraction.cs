@@ -31,6 +31,7 @@ internal sealed class ReplConsole
 {
     private readonly StringBuilder _draft = new();
     private readonly string _prompt;
+    private readonly IReadOnlyList<string> _slashCommands;
     private readonly object _gate = new();
     private bool _busyVisible;
     private int _busyRenderLines;
@@ -38,12 +39,15 @@ internal sealed class ReplConsole
     private string _busyLabel = "Thinking";
     private IReadOnlyList<string> _queuedPreview = [];
     private IReadOnlyList<string> _activityPreview = [];
+    private IReadOnlyList<string> _completionMatches = [];
+    private int _completionIndex = -1;
 
     private static readonly string[] SpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-    public ReplConsole(string prompt)
+    public ReplConsole(string prompt, IEnumerable<string>? slashCommands = null)
     {
         _prompt = prompt;
+        _slashCommands = (slashCommands ?? []).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(static c => c, StringComparer.OrdinalIgnoreCase).ToList();
     }
 
     public bool HasDraft
@@ -90,6 +94,7 @@ internal sealed class ReplConsole
                 {
                     var submitted = _draft.ToString().Trim();
                     _draft.Clear();
+                    ResetCompletionStateLocked();
 
                     if (!busy)
                     {
@@ -107,19 +112,25 @@ internal sealed class ReplConsole
 
                     return string.IsNullOrEmpty(submitted) ? null : new PromptSubmission(submitted);
                 }
+                case ConsoleKey.Tab:
+                    ApplySlashCompletionLocked();
+                    break;
                 case ConsoleKey.Backspace:
                     if (_draft.Length > 0)
                     {
                         _draft.Length--;
                     }
+                    ResetCompletionStateLocked();
                     break;
                 case ConsoleKey.Escape:
                     _draft.Clear();
+                    ResetCompletionStateLocked();
                     break;
                 default:
                     if (!char.IsControl(key.KeyChar))
                     {
                         _draft.Append(key.KeyChar);
+                        ResetCompletionStateLocked();
                     }
                     break;
             }
@@ -135,6 +146,59 @@ internal sealed class ReplConsole
 
             return null;
         }
+    }
+
+    private void ApplySlashCompletionLocked()
+    {
+        var draft = _draft.ToString();
+        if (!draft.StartsWith("/", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var firstSpace = draft.IndexOf(' ');
+        if (firstSpace >= 0)
+        {
+            return;
+        }
+
+        var currentToken = draft.TrimEnd();
+        if (_completionMatches.Count > 0 &&
+            _completionMatches.Contains(currentToken, StringComparer.OrdinalIgnoreCase))
+        {
+            _completionIndex = (_completionIndex + 1) % _completionMatches.Count;
+            ReplaceDraftWithCompletionLocked(_completionMatches[_completionIndex], appendSpace: _completionMatches.Count == 1);
+            return;
+        }
+
+        var matches = _slashCommands
+            .Where(cmd => cmd.StartsWith(currentToken, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (matches.Count == 0)
+        {
+            return;
+        }
+
+        _completionMatches = matches;
+        _completionIndex = 0;
+        ReplaceDraftWithCompletionLocked(matches[0], appendSpace: matches.Count == 1);
+    }
+
+    private void ReplaceDraftWithCompletionLocked(string completion, bool appendSpace)
+    {
+        _draft.Clear();
+        _draft.Append(completion);
+        if (appendSpace)
+        {
+            _draft.Append(' ');
+        }
+    }
+
+    private void ResetCompletionStateLocked()
+    {
+        _completionMatches = [];
+        _completionIndex = -1;
     }
 
     public void EnterBusy(

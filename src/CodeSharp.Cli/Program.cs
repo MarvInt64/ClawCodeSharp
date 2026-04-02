@@ -155,6 +155,7 @@ public static class Program
             CliAction.Version => PrintVersion(),
             CliAction.Login => await RunLoginAsync(),
             CliAction.Logout => RunLogout(),
+            CliAction.Config => RunConfig(options.Args),
             CliAction.Init => await RunInitAsync(),
             CliAction.SystemPrompt => PrintSystemPrompt(options),
             CliAction.Agents => PrintAgents(options.Args),
@@ -185,6 +186,7 @@ public static class Program
             [
                 ("login", "Sign in with OAuth"),
                 ("logout", "Clear saved credentials"),
+                ("config", "Manage global provider/model/API key defaults"),
                 ("init", "Initialize .codesharp configuration"),
                 ("system-prompt", "Print the generated system prompt"),
                 ("agents", "List available agents"),
@@ -229,8 +231,8 @@ public static class Program
     {
         Console.WriteLine(ConsoleUi.MessageBlock(
             "login",
-            "OAuth login is not implemented yet.\nSet ANTHROPIC_API_KEY to use Anthropic directly.",
-            "NVIDIA uses NVIDIA_API_KEY."
+            "OAuth login is not implemented yet.\nUse `codesharp config` to save provider defaults and API keys.",
+            "Anthropic, OpenAI, xAI, and NVIDIA keys can be stored in ~/.codesharp/settings.json."
         ));
         return Task.FromResult(0);
     }
@@ -238,6 +240,13 @@ public static class Program
     private static int RunLogout()
     {
         Console.WriteLine(ConsoleUi.MessageBlock("logout", "Logout is not implemented yet."));
+        return 0;
+    }
+
+    private static int RunConfig(string? args)
+    {
+        var result = ConfigCommandProcessor.Process(args, new GlobalSettingsStore());
+        Console.WriteLine(ConsoleUi.MessageBlock(result.Title, result.Body, result.Footer));
         return 0;
     }
     
@@ -297,16 +306,21 @@ Add any additional context about the project.
     {
         var cwd = options.Cwd ?? Directory.GetCurrentDirectory();
         var date = options.Date ?? ModelAliases.DefaultDate;
-        var os = Environment.OSVersion.Platform.ToString().ToLowerInvariant();
-        
-        Console.WriteLine(ConsoleUi.Panel(
+        var pluginManager = new PluginManager(cwd);
+        pluginManager.LoadFromConfig(Path.Combine(cwd, ".codesharp", "settings.json"));
+        var registry = new GlobalToolRegistry(pluginManager.AggregatedTools);
+
+        var systemPrompt = BuildSystemPrompt(
+            cwd,
+            date,
+            options.PermissionMode,
+            registry,
+            options.AllowedTools
+        );
+
+        Console.WriteLine(ConsoleUi.MessageBlock(
             "system prompt",
-            [
-                ("Identity", "You are CodeSharp, an AI-powered code assistant."),
-                ("Date", date),
-                ("OS", os),
-                ("Directory", cwd)
-            ]
+            string.Join("\n\n", systemPrompt)
         ));
         
         return 0;
@@ -450,7 +464,7 @@ Add any additional context about the project.
         Console.WriteLine();
 
         var prompt = ConsoleUi.Prompt();
-        var console = new ReplConsole(prompt);
+        var console = new ReplConsole(prompt, repl.CompletionCandidates);
         var busyLabel = $"Thinking with {FormatProvider(provider)} · {options.Model}";
         var queuedInputs = new Queue<string>();
         ActiveTurn? activeTurn = null;
@@ -867,6 +881,7 @@ Add any additional context about the project.
     private static (ConversationRuntime, GlobalToolRegistry, ToolExecutor) BuildRuntime(CliOptions options, string sessionPath)
     {
         var cwd = Directory.GetCurrentDirectory();
+        var globalSettings = new GlobalSettingsStore().Load();
         
         var session = Session.New();
         
@@ -886,8 +901,8 @@ Add any additional context about the project.
         var toolPermissions = permissionSpecs.ToDictionary(p => p.Name, p => p.Mode);
         var permissionPolicy = new PermissionPolicy(options.PermissionMode, toolPermissions);
         
-        var provider = options.Provider ?? ProviderClient.DetectProviderKind(options.Model);
-        var providerClient = ProviderClient.FromProvider(provider);
+        var provider = options.Provider ?? globalSettings.GetProviderKind() ?? ProviderClient.DetectProviderKind(options.Model);
+        var providerClient = ProviderClient.FromProvider(provider, globalSettings.GetApiKey(provider));
 
         var tools = registry.GetDefinitions(
             options.AllowedTools is not null
@@ -897,12 +912,13 @@ Add any additional context about the project.
 
         var apiClient = new StreamingApiClient(providerClient, options.Model, tools);
         
-        var systemPrompt = new List<string>
-        {
-            "You are CodeSharp, an AI-powered code assistant.",
-            $"Date: {DateTime.UtcNow:yyyy-MM-dd}",
-            $"Working Directory: {cwd}"
-        };
+        var systemPrompt = BuildSystemPrompt(
+            cwd,
+            DateTime.UtcNow.ToString("yyyy-MM-dd"),
+            options.PermissionMode,
+            registry,
+            options.AllowedTools
+        );
         
         var runtime = new ConversationRuntime(
             session,
@@ -913,5 +929,83 @@ Add any additional context about the project.
         );
         
         return (runtime, registry, toolExecutor);
+    }
+
+    private static IReadOnlyList<string> BuildSystemPrompt(
+        string cwd,
+        string date,
+        PermissionMode permissionMode,
+        GlobalToolRegistry registry,
+        IReadOnlyList<string>? allowedTools
+    )
+    {
+        var normalizedAllowedTools = allowedTools is not null
+            ? registry.NormalizeAllowedTools(allowedTools)?.ToHashSet()
+            : null;
+
+        var toolSpecs = registry.GetAllTools()
+            .Where(tool => normalizedAllowedTools is null || normalizedAllowedTools.Contains(tool.Name))
+            .OrderBy(tool => tool.Name, StringComparer.Ordinal)
+            .ToList();
+
+        var toolLines = toolSpecs.Count == 0
+            ? ["No tools are currently enabled."]
+            : toolSpecs.Select(tool =>
+                $"- {tool.Name}: {tool.Description} Requires {tool.RequiredPermission.AsString()} permission."
+            ).ToList();
+
+        var projectInstructions = ReadProjectInstructions(cwd);
+
+        var prompt = new List<string>
+        {
+            "You are CodeSharp, an AI-powered code assistant.",
+            $@"Environment
+Date: {date}
+Working Directory: {cwd}
+Permission Mode: {permissionMode.AsString()}",
+            $@"Available tools and constraints
+{string.Join("\n", toolLines)}
+
+Respect the tool surface exactly. Do not invent unavailable tools. Prefer read-only tools for analysis before using mutating tools. For write operations, make focused edits and avoid unrelated changes.",
+            @"Output style guidelines
+- Be concise, direct, and technically precise.
+- Prefer actionable answers over long preambles.
+- Use Markdown when it improves readability.
+- Use fenced code blocks with a language tag for code.
+- Summarize findings clearly after inspection instead of dumping raw tool output.
+- When giving file-specific feedback, mention the file and the concrete issue or recommendation.",
+            @"Error-handling behavior
+- If a tool fails, report the failure briefly and include the relevant reason.
+- If another safe tool can recover the missing context, try that before giving up.
+- If the task is blocked by permissions, missing files, or missing configuration, say so explicitly.
+- Do not pretend a command, edit, or lookup succeeded if it did not.
+- Preserve user work and avoid destructive actions unless explicitly requested."
+        };
+
+        if (!string.IsNullOrWhiteSpace(projectInstructions))
+        {
+            prompt.Add($"Project instructions\n{projectInstructions}");
+        }
+
+        return prompt;
+    }
+
+    private static string? ReadProjectInstructions(string cwd)
+    {
+        var path = Path.Combine(cwd, "CODESHARP.md");
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            var content = File.ReadAllText(path).Trim();
+            return string.IsNullOrWhiteSpace(content) ? null : content;
+        }
+        catch
+        {
+            return null;
+        }
     }
 }

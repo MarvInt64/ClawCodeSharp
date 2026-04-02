@@ -22,22 +22,33 @@ public class ProviderClient
 
     public static ProviderClient FromProvider(ProviderKind provider)
     {
+        return FromProvider(provider, null);
+    }
+
+    public static ProviderClient FromProvider(ProviderKind provider, string? apiKey)
+    {
         return provider switch
         {
             ProviderKind.CodeSharpApi => new ProviderClient(
-                CodeSharpApiClient.FromEnv(),
+                string.IsNullOrWhiteSpace(apiKey) ? CodeSharpApiClient.FromEnv() : new CodeSharpApiClient(apiKey),
                 ProviderKind.CodeSharpApi
             ),
             ProviderKind.Xai => new ProviderClient(
-                OpenAiCompatClient.FromEnv(OpenAiCompatConfig.Xai()),
+                string.IsNullOrWhiteSpace(apiKey)
+                    ? OpenAiCompatClient.FromEnv(OpenAiCompatConfig.Xai())
+                    : new OpenAiCompatClient(OpenAiCompatConfig.Xai() with { ApiKey = apiKey }),
                 ProviderKind.Xai
             ),
             ProviderKind.OpenAi => new ProviderClient(
-                OpenAiCompatClient.FromEnv(OpenAiCompatConfig.OpenAi()),
+                string.IsNullOrWhiteSpace(apiKey)
+                    ? OpenAiCompatClient.FromEnv(OpenAiCompatConfig.OpenAi())
+                    : new OpenAiCompatClient(OpenAiCompatConfig.OpenAi() with { ApiKey = apiKey }),
                 ProviderKind.OpenAi
             ),
             ProviderKind.Nvidia => new ProviderClient(
-                OpenAiCompatClient.FromEnv(OpenAiCompatConfig.Nvidia()),
+                string.IsNullOrWhiteSpace(apiKey)
+                    ? OpenAiCompatClient.FromEnv(OpenAiCompatConfig.Nvidia())
+                    : new OpenAiCompatClient(OpenAiCompatConfig.Nvidia() with { ApiKey = apiKey }),
                 ProviderKind.Nvidia
             ),
             _ => throw new InvalidOperationException($"Unknown provider: {provider}")

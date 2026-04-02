@@ -9,7 +9,7 @@ public static class CommandHandlers
         var lines = new List<string>
         {
             "Help",
-            "  Slash commands   Type /help, /status, /cost, /model, /permissions, /export",
+            "  Slash commands   Type /help, /config, /status, /cost, /model, /permissions, /export",
             "  Exit             /exit or /quit",
             "",
             "Commands"

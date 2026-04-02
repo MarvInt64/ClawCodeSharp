@@ -13,6 +13,7 @@ public enum CliAction
     Prompt,
     Login,
     Logout,
+    Config,
     Init,
     Help,
     Version,
@@ -42,9 +43,12 @@ public class ArgumentParser
 {
     public CliOptions Parse(string[] args)
     {
+        var globalSettings = new GlobalSettingsStore().Load();
         var model = ModelAliases.DefaultModel;
         var permissionMode = PermissionMode.DangerFullAccess;
         ProviderKind? provider = null;
+        var explicitModel = false;
+        var explicitProvider = false;
         var allowedTools = new List<string>();
         var outputFormat = "text";
         string? prompt = null;
@@ -67,10 +71,12 @@ public class ArgumentParser
                     
                 case "--model" when i + 1 < args.Length:
                     model = ModelAliases.ResolveModelAlias(args[++i]);
+                    explicitModel = true;
                     break;
                     
                 case var m when m.StartsWith("--model="):
                     model = ModelAliases.ResolveModelAlias(m[8..]);
+                    explicitModel = true;
                     break;
                     
                 case "--permission-mode" when i + 1 < args.Length:
@@ -83,10 +89,12 @@ public class ArgumentParser
                     
                 case "--provider" when i + 1 < args.Length:
                     provider = ParseProvider(args[++i]);
+                    explicitProvider = true;
                     break;
                     
                 case var p when p.StartsWith("--provider="):
                     provider = ParseProvider(p[11..]);
+                    explicitProvider = true;
                     break;
                     
                 case "--output" when i + 1 < args.Length:
@@ -126,6 +134,16 @@ public class ArgumentParser
                     
                 case "logout":
                     action = CliAction.Logout;
+                    break;
+
+                case "config":
+                    action = CliAction.Config;
+                    i++;
+                    if (i < args.Length)
+                    {
+                        argsValue = string.Join(' ', args[i..]);
+                    }
+                    i = args.Length;
                     break;
                     
                 case "init":
@@ -190,6 +208,16 @@ public class ArgumentParser
             
             i++;
         }
+
+        if (!explicitModel && !string.IsNullOrWhiteSpace(globalSettings.Model))
+        {
+            model = ModelAliases.ResolveModelAlias(globalSettings.Model);
+        }
+
+        if (!explicitProvider && globalSettings.GetProviderKind() is { } configuredProvider)
+        {
+            provider = configuredProvider;
+        }
         
         return new CliOptions(
             action,
@@ -207,12 +235,8 @@ public class ArgumentParser
         );
     }
     
-    private static ProviderKind ParseProvider(string value) => value.ToLowerInvariant() switch
-    {
-        "anthropic" => ProviderKind.CodeSharpApi,
-        "openai" => ProviderKind.OpenAi,
-        "xai" => ProviderKind.Xai,
-        "nvidia" => ProviderKind.Nvidia,
-        _ => throw new ArgumentException($"Unknown provider: {value}")
-    };
+    private static ProviderKind ParseProvider(string value) =>
+        ProviderParsing.TryParseProvider(value, out var provider)
+            ? provider
+            : throw new ArgumentException($"Unknown provider: {value}");
 }

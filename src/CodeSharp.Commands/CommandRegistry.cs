@@ -49,7 +49,7 @@ public class CommandRegistry
         new("resume", [], "Resume a previous session"),
         new("export", [], "Export session transcript", true),
         new("session", [], "Manage sessions"),
-        new("config", [], "View or edit configuration", true),
+        new("config", [], "View or edit global provider/model/API key defaults", true),
         new("memory", [], "View memory file contents", true),
         new("init", [], "Initialize .codesharp configuration", true),
         new("diff", [], "Show uncommitted changes", true),
