@@ -82,20 +82,35 @@ public class ToolExecutor : IToolExecutor
         var startInfo = new ProcessStartInfo
         {
             FileName = OperatingSystem.IsWindows() ? "cmd.exe" : "/bin/bash",
-            Arguments = OperatingSystem.IsWindows() ? $"/c {command}" : $"-c \"{command}\"",
             WorkingDirectory = _workingDirectory,
+            RedirectStandardInput = true,   // prevent subprocess from reading terminal stdin
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true
         };
-        
+
+        // Use ArgumentList for proper quoting — avoids shell-injection when command
+        // contains embedded quotes, newlines, or other special characters
+        if (OperatingSystem.IsWindows())
+        {
+            startInfo.ArgumentList.Add("/c");
+            startInfo.ArgumentList.Add(command);
+        }
+        else
+        {
+            startInfo.ArgumentList.Add("-c");
+            startInfo.ArgumentList.Add(command);
+        }
+
         using var process = new Process { StartInfo = startInfo };
         process.Start();
-        
-        var stdout = await process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderr = await process.StandardError.ReadToEndAsync(cancellationToken);
-        
+        process.StandardInput.Close(); // give subprocess /dev/null as stdin
+
+        // Read stdout and stderr concurrently to avoid deadlock on large output
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+        var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+
         using var cts = new CancellationTokenSource(timeout);
         try
         {
@@ -104,9 +119,13 @@ public class ToolExecutor : IToolExecutor
         catch (OperationCanceledException)
         {
             process.Kill();
-            return JsonSerializer.Serialize(new { error = "Command timed out", stdout, stderr });
+            var partialOut = await stdoutTask;
+            var partialErr = await stderrTask;
+            return JsonSerializer.Serialize(new { error = "Command timed out", stdout = partialOut, stderr = partialErr });
         }
-        
+
+        var stdout = await stdoutTask;
+        var stderr = await stderrTask;
         return JsonSerializer.Serialize(new { stdout, stderr, exitCode = process.ExitCode });
     }
     

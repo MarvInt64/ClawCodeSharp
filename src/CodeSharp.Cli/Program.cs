@@ -567,7 +567,7 @@ Add any additional context about the project.
             using var spinner = ConsoleUi.StartSpinner($"Thinking with {FormatProvider(provider)} · {options.Model}");
             var activity = new TurnActivityState();
 
-            var task = ExecuteTurnAsync(runtime, options.Prompt, activity, cts.Token);
+            var task = ExecuteTurnAsync(runtime, options.Prompt, activity, null, cts.Token);
             while (!task.IsCompleted)
             {
                 if (interrupts.ConsumeRequested() && !cts.IsCancellationRequested)
@@ -643,6 +643,9 @@ Add any additional context about the project.
         ActiveTurn? activeTurn = null;
         var exitRequested = false;
         DateTimeOffset? lastInterruptAt = null;
+        IPermissionPrompter? prompter = repl.PermissionMode != PermissionMode.DangerFullAccess
+            ? new ReplPermissionPrompter(repl.PermissionMode)
+            : null;
 
         using var interrupts = new ConsoleInterruptRelay();
 
@@ -728,6 +731,7 @@ Add any additional context about the project.
                     busyLabel,
                     queuedInputs,
                     console,
+                    prompter,
                     turn => activeTurn = turn
                 );
                 if (!exitRequested && activeTurn is null)
@@ -757,6 +761,7 @@ Add any additional context about the project.
                             busyLabel,
                             queuedInputs,
                             console,
+                            prompter,
                             turn => activeTurn = turn
                         );
                         if (!exitRequested && activeTurn is null)
@@ -1318,6 +1323,7 @@ Add any additional context about the project.
         string busyLabel,
         Queue<string> queuedInputs,
         ReplConsole console,
+        IPermissionPrompter? prompter,
         Action<ActiveTurn> setActiveTurn
     )
     {
@@ -1345,7 +1351,7 @@ Add any additional context about the project.
         var cts = new CancellationTokenSource();
         var activity = new TurnActivityState();
         console.SetContent(ConsoleUi.UserTurn(trimmed));
-        var task = ExecuteTurnAsync(runtime, trimmed, activity, cts.Token);
+        var task = ExecuteTurnAsync(runtime, trimmed, activity, prompter, cts.Token);
         setActiveTurn(new ActiveTurn(task, cts, activity));
         console.EnterBusy(busyLabel, queuedInputs, activity.Snapshot());
         return false;
@@ -1355,6 +1361,7 @@ Add any additional context about the project.
         ConversationRuntime runtime,
         string input,
         TurnActivityState activity,
+        IPermissionPrompter? prompter,
         CancellationToken cancellationToken
     )
     {
@@ -1364,6 +1371,7 @@ Add any additional context about the project.
         {
             var summary = await runtime.RunTurnAsync(
                 input,
+                prompter: prompter,
                 activitySink: activity.Record,
                 cancellationToken: cancellationToken
             );
@@ -1427,7 +1435,8 @@ Add any additional context about the project.
 
         try
         {
-            if (!Console.KeyAvailable)
+            // Don't race with the permission prompter which reads keys on the turn thread
+            if (!Console.KeyAvailable || ReplPermissionPrompter.IsConsoleActive)
             {
                 return false;
             }
