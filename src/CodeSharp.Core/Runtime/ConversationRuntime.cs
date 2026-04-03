@@ -1,3 +1,6 @@
+using System.Text;
+using System.Text.Json;
+
 namespace CodeSharp.Core;
 
 public record ConversationRuntimeCheckpoint(int MessageCount, UsageTrackerSnapshot Usage);
@@ -9,6 +12,12 @@ public class ConversationRuntime
         "read_file",
         "glob_search",
         "grep_search"
+    };
+
+    private static readonly HashSet<string> MutatingFileTools = new(StringComparer.Ordinal)
+    {
+        "write_file",
+        "edit_file"
     };
 
     private readonly Session _session;
@@ -75,7 +84,29 @@ public class ConversationRuntime
             }
             
             var request = new ApiRequest(_systemPrompt, _session.Messages);
-            var events = await _apiClient.StreamAsync(request, cancellationToken);
+            var liveAssistantText = new StringBuilder();
+            var lastDraft = string.Empty;
+            var events = await _apiClient.StreamAsync(
+                request,
+                assistantEvent =>
+                {
+                    if (assistantEvent is not AssistantEvent.TextDelta textDelta)
+                    {
+                        return;
+                    }
+
+                    liveAssistantText.Append(textDelta.Delta);
+                    var normalized = NormalizeAssistantLiveText(liveAssistantText.ToString());
+                    if (string.IsNullOrWhiteSpace(normalized) || string.Equals(normalized, lastDraft, StringComparison.Ordinal))
+                    {
+                        return;
+                    }
+
+                    lastDraft = normalized;
+                    activitySink?.Invoke(new RuntimeActivity.AssistantDraft(normalized));
+                },
+                cancellationToken
+            );
             
             var (assistantMessage, usage) = BuildAssistantMessage(events);
             if (usage is not null)
@@ -87,6 +118,8 @@ public class ConversationRuntime
                 .OfType<ContentBlock.ToolUse>()
                 .Select(tu => (tu.Id, tu.Name, tu.Input))
                 .ToList();
+
+            ValidateToolUseInputs(pendingToolUses);
             
             _session.AddMessage(assistantMessage);
             assistantMessages.Add(assistantMessage);
@@ -153,6 +186,7 @@ public class ConversationRuntime
     {
         var results = new ConversationMessage[pendingToolUses.Count];
         var parallelBatch = new List<PreparedToolExecution>();
+        var mutatedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         for (var index = 0; index < pendingToolUses.Count; index++)
         {
@@ -174,7 +208,24 @@ public class ConversationRuntime
             }
 
             await FlushParallelBatchAsync(parallelBatch, results, cancellationToken);
+
+            if (TryGetMutatingToolPath(toolName, input) is { } path &&
+                mutatedPaths.Contains(path))
+            {
+                var message = $"`{DisplayPath(path)}` was already modified earlier in this assistant step. Re-read it in the next step before applying another edit.";
+                activitySink?.Invoke(new RuntimeActivity.ToolStarted(toolUseId, toolName, input));
+                activitySink?.Invoke(new RuntimeActivity.ToolFinished(toolUseId, toolName, message, true));
+                results[index] = ConversationMessage.ToolResult(toolUseId, toolName, message, true);
+                continue;
+            }
+
             results[index] = await prepared.ExecuteAsync(cancellationToken);
+
+            if (TryGetMutatingToolPath(toolName, input) is { } mutatedPath &&
+                IsSuccessfulToolResult(results[index]))
+            {
+                mutatedPaths.Add(mutatedPath);
+            }
         }
 
         await FlushParallelBatchAsync(parallelBatch, results, cancellationToken);
@@ -274,6 +325,50 @@ public class ConversationRuntime
 
     private static bool IsParallelSafeTool(string toolName) => ParallelSafeTools.Contains(toolName);
 
+    private string? TryGetMutatingToolPath(string toolName, string input)
+    {
+        if (!MutatingFileTools.Contains(toolName))
+        {
+            return null;
+        }
+
+        try
+        {
+            var json = JsonSerializer.Deserialize<JsonElement>(input);
+            if (json.ValueKind != JsonValueKind.Object ||
+                !json.TryGetProperty("path", out var pathElement) ||
+                pathElement.ValueKind != JsonValueKind.String)
+            {
+                return null;
+            }
+
+            var path = pathElement.GetString();
+            return string.IsNullOrWhiteSpace(path) ? null : Path.GetFullPath(path, Directory.GetCurrentDirectory());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool IsSuccessfulToolResult(ConversationMessage message) =>
+        message.Blocks
+            .OfType<ContentBlock.ToolResult>()
+            .Any(block => !block.IsError);
+
+    private static string DisplayPath(string fullPath)
+    {
+        var cwd = Directory.GetCurrentDirectory();
+        try
+        {
+            return Path.GetRelativePath(cwd, fullPath).Replace('\\', '/');
+        }
+        catch
+        {
+            return fullPath.Replace('\\', '/');
+        }
+    }
+
     private static async Task FlushParallelBatchAsync(
         List<PreparedToolExecution> parallelBatch,
         ConversationMessage[] results,
@@ -350,7 +445,28 @@ public class ConversationRuntime
 
         return "I'm gathering the relevant code context first.";
     }
-    
+
+    private static string? NormalizeAssistantLiveText(string text)
+    {
+        var normalized = text.Replace("\r\n", " ").Replace('\n', ' ').Trim();
+        return string.IsNullOrWhiteSpace(normalized) ? null : normalized;
+    }
+
+    private static void ValidateToolUseInputs(IReadOnlyList<(string ToolUseId, string ToolName, string Input)> pendingToolUses)
+    {
+        foreach (var (_, toolName, input) in pendingToolUses)
+        {
+            try
+            {
+                JsonSerializer.Deserialize<JsonElement>(input);
+            }
+            catch (JsonException ex)
+            {
+                throw new RuntimeError($"assistant returned invalid JSON for tool `{toolName}`: {ex.Message}");
+            }
+        }
+    }
+
     private static (ConversationMessage Message, TokenUsage? Usage) BuildAssistantMessage(
         IReadOnlyList<AssistantEvent> events
     )

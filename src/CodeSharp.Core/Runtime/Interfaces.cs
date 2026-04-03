@@ -25,6 +25,8 @@ public record TurnSummary(
 
 public abstract record RuntimeActivity
 {
+    public sealed record AssistantDraft(string Text) : RuntimeActivity;
+
     public sealed record AssistantPlan(string Text) : RuntimeActivity;
 
     public sealed record ToolStarted(string ToolUseId, string ToolName, string Input) : RuntimeActivity;
@@ -36,7 +38,11 @@ public abstract record RuntimeActivity
 
 public interface IApiClient
 {
-    Task<IReadOnlyList<AssistantEvent>> StreamAsync(ApiRequest request, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<AssistantEvent>> StreamAsync(
+        ApiRequest request,
+        Action<AssistantEvent>? eventSink = null,
+        CancellationToken cancellationToken = default
+    );
 }
 
 public interface IToolExecutor

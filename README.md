@@ -1,6 +1,6 @@
 # CodeSharp - C#/.NET 10 Implementation
 
-This is the C#/.NET 10 port of the original Rust implementation of Claw Code, now consistently branded as CodeSharp, with support for Anthropic, NVIDIA, OpenAI, and xAI providers plus an improved terminal UX.
+This is the C#/.NET 10 port of the original Rust implementation of Claw Code, now consistently branded as CodeSharp, with support for Anthropic, NVIDIA, OpenAI, and xAI providers plus a much better terminal UX.
 
 ## Showcase
 
@@ -13,48 +13,48 @@ This is the C#/.NET 10 port of the original Rust implementation of Claw Code, no
 
 The current C# CLI has already been improved in several practical areas:
 
-- Assistant responses in the terminal are no longer shown as raw markdown only. The CLI now renders headings, lists, quotes, inline code, links, fenced code blocks, and horizontal rules in a terminal-friendly format.
-- Assistant output now wraps to the current console width instead of overflowing awkwardly inside the bordered output blocks.
-- Fenced `diff` and `patch` code blocks are rendered more clearly for terminal reading.
-- Markdown tables are rendered as aligned terminal tables when they fit, with a compact fallback when they are too wide.
-- The REPL now has a clearer busy state with spinner-based feedback while a turn is running.
-- Queued follow-up prompts are surfaced in the REPL instead of disappearing into the background, making multi-step interaction easier to follow.
+- Assistant responses are no longer dumped as raw markdown. The CLI now renders headings, lists, quotes, inline code, links, fenced code blocks, tables, and horizontal rules in a terminal-friendly format.
+- Long assistant output and status lines wrap to the current console width instead of overflowing awkwardly.
+- Fenced `diff` and `patch` blocks are easier to read, and file edits can surface a colored inline diff preview with green additions and red removals.
+- The REPL uses a clearer full-screen layout: the banner stays pinned at the top, while the working area below shows the latest user input, assistant plans, tool activity, and prompt state.
+- Busy-state feedback is much clearer. The spinner sits near the prompt, queued follow-up prompts are visible, and empty waiting phases are labeled instead of feeling like a hang.
 - Interrupt handling is more usable: `Ctrl+C` cancels the active turn first, and repeated interrupt handling supports a cleaner exit flow.
 - Internal activity messages are cleaner. Tool calls such as plan updates are shown as short human-readable status lines instead of raw JSON payloads like `TodoWrite {...}`.
-- The assistant now announces what it is about to inspect, search, or change, and this intent is highlighted more clearly in the REPL so the next step is easy to spot.
-- Slash commands now have interactive suggestions while typing, so entering `/` immediately shows matching commands and filters them live as you type.
-- Global provider, model, and API key defaults can be stored in `~/.codesharp/settings.json`, with a guided config flow in the CLI.
-- Repository search is more reliable: `glob_search` and `grep_search` now return counts plus capped samples instead of only raw lists, making broad codebase queries easier to verify.
-- Search tools now skip ignored build/editor directories and also respect the root `.gitignore`, reducing noisy matches from irrelevant files.
+- The assistant now says what it is about to inspect, search, or change before using tools, and that intent is highlighted clearly in the REPL.
+- Assistant text now streams into the UI while the model is still thinking, which reduces the dead time between tool calls and the next visible step.
+- Slash commands now have live suggestions while typing. Typing `/` immediately shows matching commands and narrows them as you continue typing.
+- Global provider, model, and API key defaults can be stored in `~/.codesharp/settings.json`, with an interactive config flow in the CLI.
+- The config menu itself is more guided: it keeps the header visible and supports arrow-key navigation for provider, model, and API key management.
+- Read-only repo analysis is faster because `read_file`, `glob_search`, and `grep_search` can run in parallel within the same assistant step.
+- Repository search is more reliable: `glob_search` and `grep_search` return counts plus capped samples instead of only raw lists, respect the root `.gitignore`, and skip noisy folders like `.git`, `bin`, `obj`, `.idea`, and `node_modules`.
 - Broad negative claims are handled more carefully: the runtime and prompt now push the model to verify search results before saying something does not exist in the codebase.
-- Overall REPL output is easier to scan because user-facing status and assistant output now prioritize readability over raw protocol detail.
 
 
 ## Project Structure
 
 ```
-csharp/
-├── CodeSharp.sln                    # Solution file
-└── src/
-    ├── CodeSharp.Core/              # Core runtime, session, permissions
-    ├── CodeSharp.Api/               # HTTP client, API providers
-    ├── CodeSharp.Tools/             # Tool registry and execution
-    ├── CodeSharp.Plugins/           # Plugin management
-    ├── CodeSharp.Lsp/               # LSP integration
-    ├── CodeSharp.Commands/          # Slash commands
-    ├── CodeSharp.Cli/               # Main CLI application
-    └── CodeSharp.Server/            # HTTP server for sessions
+CodeSharp.sln
+src/
+├── CodeSharp.Core/                  # Core runtime, session, permissions
+├── CodeSharp.Api/                   # HTTP client, API providers
+├── CodeSharp.Tools/                 # Tool registry and execution
+├── CodeSharp.Plugins/               # Plugin management
+├── CodeSharp.Lsp/                   # LSP integration
+├── CodeSharp.Commands/              # Slash commands
+├── CodeSharp.Cli/                   # Main CLI application
+└── CodeSharp.Server/                # HTTP server for sessions
 ```
 
 ## Build
 
 Requirements:
-- .NET 10 SDK (preview)
+- .NET 10 SDK
+
+`global.json` currently pins SDK `10.0.100`.
 
 ```bash
-cd csharp
-dotnet restore
-dotnet build
+dotnet restore CodeSharp.sln
+dotnet build CodeSharp.sln
 ```
 
 ## Run
@@ -62,7 +62,6 @@ dotnet build
 ### Interactive REPL Mode
 
 ```bash
-cd csharp
 dotnet run --project src/CodeSharp.Cli
 ```
 
@@ -78,12 +77,128 @@ dotnet run --project src/CodeSharp.Cli -- "Explain this codebase"
 dotnet run --project src/CodeSharp.Cli -- --provider nvidia -p "What does this function do?"
 ```
 
+### Default Model
+
+The default model is currently `moonshotai/kimi-k2.5`, routed through the NVIDIA provider unless you override it.
+
+## Standalone Binary
+
+You can build a standalone single-file binary with `dotnet publish`.
+
+### macOS (Apple Silicon)
+
+```bash
+dotnet publish src/CodeSharp.Cli/CodeSharp.Cli.csproj \
+  -c Release \
+  -r osx-arm64 \
+  --self-contained true \
+  /p:PublishSingleFile=true
+```
+
+### macOS (Intel)
+
+```bash
+dotnet publish src/CodeSharp.Cli/CodeSharp.Cli.csproj \
+  -c Release \
+  -r osx-x64 \
+  --self-contained true \
+  /p:PublishSingleFile=true
+```
+
+### Linux x64
+
+```bash
+dotnet publish src/CodeSharp.Cli/CodeSharp.Cli.csproj \
+  -c Release \
+  -r linux-x64 \
+  --self-contained true \
+  /p:PublishSingleFile=true
+```
+
+### Windows x64
+
+```bash
+dotnet publish src/CodeSharp.Cli/CodeSharp.Cli.csproj \
+  -c Release \
+  -r win-x64 \
+  --self-contained true \
+  /p:PublishSingleFile=true
+```
+
+The published binary ends up under:
+
+```text
+src/CodeSharp.Cli/bin/Release/net10.0/<RID>/publish/
+```
+
+If you prefer a framework-dependent build instead of bundling the runtime, replace `--self-contained true` with `--self-contained false`.
+
+## Config Files
+
+CodeSharp now uses a few distinct config and state files. They serve different purposes:
+
+- `~/.codesharp/settings.json`
+  Global defaults for the CLI. This is where `codesharp config` stores your preferred provider, model, and provider-specific API keys.
+- `./.codesharp/settings.json`
+  Project-local config created by `codesharp init`. This is the repo-local config file CodeSharp looks for in the current workspace, including plugin/config loading for that repo.
+- `./CODESHARP.md`
+  Project instructions for the agent. If present, its contents are included in the generated system prompt so you can define coding conventions, repo context, or workflow notes.
+- `./.codesharp/sessions/session-*.json`
+  Saved conversation/session files for prompt and REPL runs.
+- `./.codesharp-todos.json`
+  Todo state written by the internal plan/todo tool.
+
+CLI flags still win over stored defaults. For example, `--model` and `--provider` override values from `~/.codesharp/settings.json` for that run.
+
+### Global Config Example
+
+```json
+{
+  "Model": "moonshotai/kimi-k2.5",
+  "Provider": "nvidia",
+  "ApiKeys": {
+    "Nvidia": "nvapi-..."
+  }
+}
+```
+
+### Project Bootstrap
+
+Run this once inside a repo to create the local project files:
+
+```bash
+codesharp init
+```
+
+That creates:
+
+- `.codesharp/settings.json`
+- `CODESHARP.md`
+
+### Managing Global Defaults
+
+Interactive menu:
+
+```bash
+codesharp config
+```
+
+Non-interactive examples:
+
+```bash
+codesharp config show
+codesharp config set provider nvidia
+codesharp config set model moonshotai/kimi-k2.5
+codesharp config set api-key nvidia
+codesharp config unset model
+```
+
 ## Available Options
 
 | Flag | Description |
 |------|-------------|
 | `-p` | Run a single prompt and exit |
-| `--model` | Model to use (default: claude-opus-4-6) |
+| `--model` | Model to use (default: `moonshotai/kimi-k2.5`) |
 | `--provider` | API provider: anthropic, nvidia, openai, xai |
 | `--permission-mode` | Permission mode: read-only, workspace-write, danger-full-access |
 | `--allowedTools` | Comma-separated list of allowed tools |

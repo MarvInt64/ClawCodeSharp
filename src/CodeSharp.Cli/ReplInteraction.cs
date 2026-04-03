@@ -436,9 +436,15 @@ internal sealed class ReplConsole
             lines.AddRange(wrappedActivityLines);
         }
         lines.AddRange(queuedLines);
-        if (_activityPreview.Count > 0 && !_activityPreview.Any(IsRunningActivityLine))
+        if (_activityPreview.Count > 0 &&
+            !_activityPreview.Any(IsRunningActivityLine) &&
+            !_activityPreview.Any(IsAssistantInfoLine))
         {
-            lines.Add(ConsoleUi.Muted("  waiting for assistant response..."));
+            lines.Add(ConsoleUi.Muted(
+                HasErrorActivityLine(_activityPreview)
+                    ? "  assistant is revising after a tool error..."
+                    : "  waiting for assistant response..."
+            ));
         }
         lines.Add(BuildStatus(_busyLabel));
         lines.Add(BuildPromptLineLocked());
@@ -592,6 +598,12 @@ internal sealed class ReplConsole
 
     private static bool IsRunningActivityLine(string line) =>
         line.TrimStart().StartsWith("⋯", StringComparison.Ordinal);
+
+    private static bool IsAssistantInfoLine(string line) =>
+        line.Contains("PLAN", StringComparison.Ordinal);
+
+    private static bool HasErrorActivityLine(IEnumerable<string> lines) =>
+        lines.Any(line => line.TrimStart().StartsWith("✗", StringComparison.Ordinal));
 
     private static string PreviewQueuedMessage(string input)
     {

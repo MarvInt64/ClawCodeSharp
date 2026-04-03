@@ -43,19 +43,21 @@ internal sealed class TurnActivityState
         {
             switch (activity)
             {
+                case RuntimeActivity.AssistantDraft draft:
+                    UpsertAssistantDraftLine(draft.Text);
+                    break;
                 case RuntimeActivity.AssistantPlan plan:
-                    _lines.Add(new ActivityLine(
-                        $"assistant-plan-{_lines.Count + 1}",
-                        "assistant_plan",
-                        plan.Text,
-                        ActivityLineStatus.Info
-                    ));
+                    CommitAssistantPlanLine(plan.Text);
                     break;
                 case RuntimeActivity.ToolStarted started:
+                    var startDescription = MarkRetryIfNeeded(
+                        started.ToolName,
+                        Program.DescribeToolStart(started.ToolName, started.Input)
+                    );
                     _lines.Add(new ActivityLine(
                         started.ToolUseId,
                         started.ToolName,
-                        Program.DescribeToolStart(started.ToolName, started.Input),
+                        startDescription,
                         ActivityLineStatus.Running
                     ));
                     break;
@@ -75,7 +77,7 @@ internal sealed class TurnActivityState
                         {
                             Description = description,
                             Status = finished.IsError ? ActivityLineStatus.Error : ActivityLineStatus.Success,
-                            DetailLines = Program.ExtractToolPreviewLines(finished.ToolName, finished.Output)
+                            DetailLines = Program.ExtractToolPreviewLines(finished.ToolName, finished.Output, finished.IsError)
                         };
                     }
                     else
@@ -90,7 +92,7 @@ internal sealed class TurnActivityState
                                 finished.IsError
                             ),
                             finished.IsError ? ActivityLineStatus.Error : ActivityLineStatus.Success,
-                            DetailLines: Program.ExtractToolPreviewLines(finished.ToolName, finished.Output)
+                            DetailLines: Program.ExtractToolPreviewLines(finished.ToolName, finished.Output, finished.IsError)
                         ));
                     }
                     break;
@@ -127,7 +129,18 @@ internal sealed class TurnActivityState
     {
         lock (_gate)
         {
-            return _lines.SelectMany(Program.FormatActivityLines).ToList();
+            var output = new List<string>();
+            foreach (var line in _lines)
+            {
+                if (line.ToolName == "assistant_plan" && output.Count > 0 && output[^1].Length > 0)
+                {
+                    output.Add(string.Empty);
+                }
+
+                output.AddRange(Program.FormatActivityLines(line));
+            }
+
+            return output;
         }
     }
 
@@ -143,12 +156,152 @@ internal sealed class TurnActivityState
 
         return -1;
     }
+
+    private void UpsertAssistantDraftLine(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        for (var i = _lines.Count - 1; i >= 0; i--)
+        {
+            if (_lines[i].ToolName != "assistant_draft")
+            {
+                continue;
+            }
+
+            if (string.Equals(_lines[i].Description, text, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _lines[i] = _lines[i] with { Description = text, Status = ActivityLineStatus.Info };
+            return;
+        }
+
+        _lines.Add(new ActivityLine(
+            "assistant-draft",
+            "assistant_draft",
+            text,
+            ActivityLineStatus.Info
+        ));
+    }
+
+    private void CommitAssistantPlanLine(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        RemoveAssistantDraftLine();
+
+        for (var i = _lines.Count - 1; i >= 0; i--)
+        {
+            if (_lines[i].ToolName != "assistant_plan")
+            {
+                continue;
+            }
+
+            if (string.Equals(_lines[i].Description, text, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            break;
+        }
+
+        _lines.Add(new ActivityLine(
+            $"assistant-plan-{_lines.Count}",
+            "assistant_plan",
+            text,
+            ActivityLineStatus.Info
+        ));
+    }
+
+    private void RemoveAssistantDraftLine()
+    {
+        for (var i = _lines.Count - 1; i >= 0; i--)
+        {
+            if (_lines[i].ToolName == "assistant_draft")
+            {
+                _lines.RemoveAt(i);
+                return;
+            }
+        }
+    }
+
+    private string MarkRetryIfNeeded(string toolName, string description)
+    {
+        var attempt = CountAttempts(toolName, description) + 1;
+        if (attempt == 1)
+        {
+            return description;
+        }
+
+        var retryDescription = toolName switch
+        {
+            "read_file" when description.StartsWith("reading ", StringComparison.Ordinal) =>
+                $"re-reading {description["reading ".Length..]}",
+            "edit_file" when description.StartsWith("editing ", StringComparison.Ordinal) =>
+                $"retrying edit of {description["editing ".Length..]}",
+            "write_file" when description.StartsWith("writing ", StringComparison.Ordinal) =>
+                $"retrying write of {description["writing ".Length..]}",
+            "glob_search" or "grep_search" => $"re-running {description}",
+            _ => $"retrying {description}"
+        };
+
+        return $"{retryDescription} (attempt {attempt})";
+    }
+
+    private int CountAttempts(string toolName, string description)
+    {
+        var key = CanonicalizeStartDescription(toolName, description);
+        return _lines.Count(line =>
+            line.ToolName == toolName &&
+            string.Equals(CanonicalizeStartDescription(line.ToolName, line.Description), key, StringComparison.Ordinal));
+    }
+
+    private static string CanonicalizeStartDescription(string toolName, string description)
+    {
+        var normalized = description;
+        var attemptIndex = normalized.LastIndexOf(" (attempt ", StringComparison.Ordinal);
+        if (attemptIndex >= 0)
+        {
+            normalized = normalized[..attemptIndex];
+        }
+
+        return toolName switch
+        {
+            "read_file" when normalized.StartsWith("re-reading ", StringComparison.Ordinal) =>
+                $"reading {normalized["re-reading ".Length..]}",
+            "edit_file" when normalized.StartsWith("retrying edit of ", StringComparison.Ordinal) =>
+                $"editing {normalized["retrying edit of ".Length..]}",
+            "write_file" when normalized.StartsWith("retrying write of ", StringComparison.Ordinal) =>
+                $"writing {normalized["retrying write of ".Length..]}",
+            "glob_search" or "grep_search" when normalized.StartsWith("re-running ", StringComparison.Ordinal) =>
+                normalized["re-running ".Length..],
+            "bash" or "PowerShell" when normalized.StartsWith("retrying ", StringComparison.Ordinal) =>
+                normalized["retrying ".Length..],
+            _ => normalized
+        };
+    }
 }
 
 public static class Program
 {
     private const string Version = "0.1.0";
     private static readonly TimeSpan ExitInterruptWindow = TimeSpan.FromSeconds(2);
+    private static readonly HashSet<string> HiddenModelTools = new(StringComparer.Ordinal)
+    {
+        "REPL",
+        "Agent",
+        "Skill",
+        "ToolSearch",
+        "NotebookEdit",
+        "Config"
+    };
     
     public static async Task<int> Main(string[] args)
     {
@@ -724,13 +877,13 @@ Add any additional context about the project.
 
         return toolName switch
         {
-            "read_file" => $"reading {JsonString(payload, "path") ?? "file"}",
-            "write_file" => $"writing {JsonString(payload, "path") ?? "file"}",
-            "edit_file" => $"editing {JsonString(payload, "path") ?? "file"}",
-            "glob_search" => $"finding {JsonString(payload, "pattern") ?? "files"} in {JsonString(payload, "path") ?? "."}",
-            "grep_search" => $"searching for {Quote(JsonString(payload, "pattern"))} in {JsonString(payload, "path") ?? "."}",
-            "bash" => $"running {Quote(Truncate(JsonString(payload, "command"), 56))}",
-            "PowerShell" => $"running {Quote(Truncate(JsonString(payload, "command"), 56))}",
+            "read_file" => $"reading {DisplayPath(JsonString(payload, "path")) ?? "file"}",
+            "write_file" => $"writing {DisplayPath(JsonString(payload, "path")) ?? "file"}",
+            "edit_file" => $"editing {DisplayPath(JsonString(payload, "path")) ?? "file"}",
+            "glob_search" => DescribeGlobSearchStart(payload),
+            "grep_search" => DescribeGrepSearchStart(payload),
+            "bash" => DescribeShellCommandStart(JsonString(payload, "command")),
+            "PowerShell" => DescribeShellCommandStart(JsonString(payload, "command")),
             "WebFetch" => $"fetching {JsonString(payload, "url") ?? "url"}",
             "WebSearch" => $"searching web for {Quote(JsonString(payload, "query") ?? JsonString(payload, "prompt"))}",
             "TodoWrite" => DescribeTodoWrite(payload),
@@ -751,21 +904,25 @@ Add any additional context about the project.
         {
         }
 
-        var path = JsonString(payload, "path") ?? ExtractPathFromActivityDescription(fallbackDescription) ?? "file";
+        var path = DisplayPath(JsonString(payload, "path")) ?? ExtractPathFromActivityDescription(fallbackDescription) ?? "file";
 
         return toolName switch
         {
+            "read_file" => DescribeReadFileFinish(payload, fallbackDescription),
             "write_file" => isError ? $"failed writing {path}" : $"wrote {path}",
             "edit_file" => isError ? $"failed editing {path}" : $"edited {path}",
+            "TodoWrite" => isError ? "failed updating plan" : fallbackDescription,
             _ => fallbackDescription
         };
     }
 
-    internal static IReadOnlyList<string>? ExtractToolPreviewLines(string toolName, string output)
+    internal static IReadOnlyList<string>? ExtractToolPreviewLines(string toolName, string output, bool isError)
     {
-        if (toolName is not ("write_file" or "edit_file"))
+        if (isError)
         {
-            return null;
+            return string.IsNullOrWhiteSpace(output)
+                ? null
+                : WrapToolDetailText(output);
         }
 
         JsonElement? payload = null;
@@ -778,6 +935,16 @@ Add any additional context about the project.
             return string.IsNullOrWhiteSpace(output)
                 ? null
                 : WrapToolDetailText(output);
+        }
+
+        if (toolName == "read_file")
+        {
+            return ExtractReadFilePreviewLines(payload);
+        }
+
+        if (toolName is not ("write_file" or "edit_file"))
+        {
+            return null;
         }
 
         if (payload is not { ValueKind: JsonValueKind.Object } json ||
@@ -806,12 +973,24 @@ Add any additional context about the project.
 
     private static string? ExtractPathFromActivityDescription(string description)
     {
-        var prefixes = new[] { "editing ", "writing ", "reading ", "failed editing ", "failed writing " };
+        var prefixes = new[]
+        {
+            "editing ",
+            "writing ",
+            "reading ",
+            "re-reading ",
+            "retrying edit of ",
+            "retrying write of ",
+            "failed editing ",
+            "failed writing "
+        };
         foreach (var prefix in prefixes)
         {
             if (description.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             {
-                return description[prefix.Length..];
+                var path = description[prefix.Length..];
+                var attemptIndex = path.LastIndexOf(" (attempt ", StringComparison.Ordinal);
+                return attemptIndex >= 0 ? path[..attemptIndex] : path;
             }
         }
 
@@ -843,6 +1022,251 @@ Add any additional context about the project.
         return json.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString()
             : null;
+    }
+
+    private static int? JsonInt(JsonElement? payload, string propertyName)
+    {
+        if (payload is not { ValueKind: JsonValueKind.Object } json)
+        {
+            return null;
+        }
+
+        return json.TryGetProperty(propertyName, out var value) &&
+               value.ValueKind == JsonValueKind.Number &&
+               value.TryGetInt32(out var number)
+            ? number
+            : null;
+    }
+
+    private static bool? JsonBool(JsonElement? payload, string propertyName)
+    {
+        if (payload is not { ValueKind: JsonValueKind.Object } json)
+        {
+            return null;
+        }
+
+        return json.TryGetProperty(propertyName, out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False
+            ? value.GetBoolean()
+            : null;
+    }
+
+    private static string DescribeReadFileFinish(JsonElement? payload, string fallbackDescription)
+    {
+        var path = DisplayPath(JsonString(payload, "path")) ?? ExtractPathFromActivityDescription(fallbackDescription) ?? "file";
+        var startLine = JsonInt(payload, "startLine");
+        var endLine = JsonInt(payload, "endLine");
+
+        if (startLine is > 0 && endLine is > 0)
+        {
+            return startLine == endLine
+                ? $"read {path} (line {startLine})"
+                : $"read {path} (lines {startLine}-{endLine})";
+        }
+
+        return $"read {path}";
+    }
+
+    private static IReadOnlyList<string>? ExtractReadFilePreviewLines(JsonElement? payload)
+    {
+        var hasMore = JsonBool(payload, "hasMore") == true;
+        if (!hasMore)
+        {
+            return null;
+        }
+
+        var nextOffset = JsonInt(payload, "nextOffset");
+        var nextLine = nextOffset is >= 0 ? nextOffset.Value + 1 : (int?)null;
+        return
+        [
+            nextLine is > 0
+                ? $"more available from line {nextLine}"
+                : "more available"
+        ];
+    }
+
+    private static string DescribeGlobSearchStart(JsonElement? payload)
+    {
+        var pattern = JsonString(payload, "pattern") ?? "files";
+        var path = DisplayPath(JsonString(payload, "path")) ?? ".";
+
+        if (pattern is "**/*" or "*")
+        {
+            return path == "." ? "scanning workspace files" : $"scanning files in {path}";
+        }
+
+        return $"finding {pattern} in {path}";
+    }
+
+    private static string DescribeGrepSearchStart(JsonElement? payload)
+    {
+        var pattern = Quote(JsonString(payload, "pattern"));
+        var path = DisplayPath(JsonString(payload, "path")) ?? ".";
+        return $"searching for {pattern} in {path}";
+    }
+
+    private static string DescribeShellCommandStart(string? command)
+    {
+        if (string.IsNullOrWhiteSpace(command))
+        {
+            return "running shell command";
+        }
+
+        var trimmed = command.Trim();
+        if (TryDescribeSedCommand(trimmed, out var sedDescription))
+        {
+            return sedDescription;
+        }
+
+        if (TryDescribeRipgrepCommand(trimmed, out var rgDescription))
+        {
+            return rgDescription;
+        }
+
+        if (TryDescribeHeadTailCommand(trimmed, out var headTailDescription))
+        {
+            return headTailDescription;
+        }
+
+        if (TryDescribeByteInspectionCommand(trimmed, out var byteDescription))
+        {
+            return byteDescription;
+        }
+
+        if (TryDescribeContentSearchCommand(trimmed, out var contentSearchDescription))
+        {
+            return contentSearchDescription;
+        }
+
+        return $"running {Quote(Truncate(trimmed, 120))}";
+    }
+
+    private static bool TryDescribeSedCommand(string command, out string description)
+    {
+        description = string.Empty;
+        if (!command.StartsWith("sed -n ", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var path = ExtractPathLikeToken(command);
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            description = "inspecting exact file lines";
+            return true;
+        }
+
+        description = $"inspecting exact lines in {DisplayPath(path) ?? path}";
+        return true;
+    }
+
+    private static bool TryDescribeRipgrepCommand(string command, out string description)
+    {
+        description = string.Empty;
+        if (!command.StartsWith("rg ", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        description = $"running search command {Quote(Truncate(command, 120))}";
+        return true;
+    }
+
+    private static bool TryDescribeHeadTailCommand(string command, out string description)
+    {
+        description = string.Empty;
+        if (!command.Contains("head ", StringComparison.Ordinal) && !command.Contains("tail ", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var path = ExtractPathLikeToken(command);
+        description = string.IsNullOrWhiteSpace(path)
+            ? "inspecting a file excerpt"
+            : $"inspecting a file excerpt in {DisplayPath(path) ?? path}";
+        return true;
+    }
+
+    private static bool TryDescribeByteInspectionCommand(string command, out string description)
+    {
+        description = string.Empty;
+        if (!command.StartsWith("od ", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var path = ExtractPathLikeToken(command);
+        description = string.IsNullOrWhiteSpace(path)
+            ? "inspecting file bytes"
+            : $"inspecting file bytes in {DisplayPath(path) ?? path}";
+        return true;
+    }
+
+    private static bool TryDescribeContentSearchCommand(string command, out string description)
+    {
+        description = string.Empty;
+        if (!command.Contains("Get-Content", StringComparison.Ordinal) &&
+            !command.Contains("Select-String", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var path = ExtractPathLikeToken(command);
+        description = string.IsNullOrWhiteSpace(path)
+            ? "inspecting file content via shell"
+            : $"inspecting file content in {DisplayPath(path) ?? path}";
+        return true;
+    }
+
+    private static string? ExtractPathLikeToken(string command)
+    {
+        var parts = command.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var part in parts)
+        {
+            var token = part.Trim().Trim('"', '\'', '(', ')');
+            if (string.IsNullOrWhiteSpace(token) || token.StartsWith("-", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (LooksLikePath(token))
+            {
+                return token;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool LooksLikePath(string token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            return false;
+        }
+
+        return token.StartsWith("/", StringComparison.Ordinal) ||
+               token.StartsWith("./", StringComparison.Ordinal) ||
+               token.StartsWith("../", StringComparison.Ordinal) ||
+               token.Contains('/') ||
+               token.Contains('\\');
+    }
+
+    private static string? DisplayPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        var normalized = path.Replace('\\', '/');
+        var cwd = Directory.GetCurrentDirectory().Replace('\\', '/').TrimEnd('/');
+        if (Path.IsPathRooted(path) &&
+            normalized.StartsWith(cwd + "/", StringComparison.OrdinalIgnoreCase))
+        {
+            return normalized[(cwd.Length + 1)..];
+        }
+
+        return normalized;
     }
 
     private static string Quote(string? value) =>
@@ -1031,11 +1455,13 @@ Add any additional context about the project.
         
         var toolExecutor = new ToolExecutor(registry, cwd);
         
+        var normalizedAllowedTools = options.AllowedTools is not null
+            ? registry.NormalizeAllowedTools(options.AllowedTools)?.ToHashSet()
+            : null;
+
         var permissionSpecs = registry.GetPermissionSpecs(
-            options.AllowedTools is not null
-                ? registry.NormalizeAllowedTools(options.AllowedTools)?.ToHashSet()
-                : null
-        );
+            normalizedAllowedTools
+        ).Where(spec => IsModelVisibleTool(spec.Name)).ToList();
         
         var toolPermissions = permissionSpecs.ToDictionary(p => p.Name, p => p.Mode);
         var permissionPolicy = new PermissionPolicy(options.PermissionMode, toolPermissions);
@@ -1043,11 +1469,10 @@ Add any additional context about the project.
         var provider = options.Provider ?? globalSettings.GetProviderKind() ?? ProviderClient.DetectProviderKind(options.Model);
         var providerClient = ProviderClient.FromProvider(provider, globalSettings.GetApiKey(provider));
 
-        var tools = registry.GetDefinitions(
-            options.AllowedTools is not null
-                ? registry.NormalizeAllowedTools(options.AllowedTools)?.ToHashSet()
-                : null
-        ).Select(t => new Api.ToolDefinition(t.Name, t.Description, t.InputSchema)).ToList();
+        var tools = registry.GetDefinitions(normalizedAllowedTools)
+            .Where(t => IsModelVisibleTool(t.Name))
+            .Select(t => new Api.ToolDefinition(t.Name, t.Description, t.InputSchema))
+            .ToList();
 
         var apiClient = new StreamingApiClient(providerClient, options.Model, tools);
         
@@ -1084,6 +1509,7 @@ Add any additional context about the project.
 
         var toolSpecs = registry.GetAllTools()
             .Where(tool => normalizedAllowedTools is null || normalizedAllowedTools.Contains(tool.Name))
+            .Where(tool => IsModelVisibleTool(tool.Name))
             .OrderBy(tool => tool.Name, StringComparer.Ordinal)
             .ToList();
 
@@ -1111,8 +1537,16 @@ Respect the tool surface exactly. Do not invent unavailable tools. Prefer read-o
 - For repository exploration, start with grep_search or glob_search before calling read_file on many files.
 - Use glob_search to narrow candidate files by name or path pattern.
 - Use grep_search to find placeholders, TODOs, 'not implemented', specific symbols, or feature flags across the repo.
-- After search narrows the candidate set, use read_file on the few most relevant files.
-- Avoid shotgun-reading many files just to discover where a feature lives.",
+- grep_search results include the matched line, its line number, and surrounding context lines. Use those context lines to assess whether you need more — often they are enough to proceed without a read_file at all.
+- When you do need read_file after grep_search, use the reported line number as the `offset` to jump directly to the relevant section. Never re-read a file from line 1 if you already know the target line number.
+- Prefer smaller paged read_file calls over large full-file reads. `read_file` returns slices plus `hasMore` and `nextOffset` for follow-up reads.
+- Avoid shotgun-reading many files just to discover where a feature lives.
+- Avoid overly broad glob_search patterns like `**/*` unless you truly need the whole workspace.
+- Prefer built-in file tools over ad-hoc shell inspection commands when `read_file`, `glob_search`, or `grep_search` already cover the need.
+- If `edit_file` fails because the target snippet no longer matches, the error message will show the actual file content at that location. Use those exact lines as your new `old_string` and retry immediately — do not call `read_file` again unless the error says the line was not found at all.
+- If `edit_file` fails a second time on the same location, stop retrying and use `write_file` to replace the entire function or section with a complete, correct version.
+- Do not use `bash`, `PowerShell`, `head`, `tail`, `od`, `Get-Content`, or similar shell probes to inspect file contents when `read_file` can do it directly.
+- Shell-based file inspection of workspace files may be rejected; use `read_file` instead.",
             @"Search and verification rules
 - Do not claim that something is absent from the codebase unless the relevant search result actually returned zero matches.
 - For broad repo questions, prefer at least one broad search and one targeted follow-up search before concluding nothing was found.
@@ -1139,6 +1573,21 @@ Respect the tool surface exactly. Do not invent unavailable tools. Prefer read-o
         }
 
         return prompt;
+    }
+
+    private static bool IsModelVisibleTool(string toolName)
+    {
+        if (HiddenModelTools.Contains(toolName))
+        {
+            return false;
+        }
+
+        if (toolName == "PowerShell" && !OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+
+        return true;
     }
 
     private static string? ReadProjectInstructions(string cwd)

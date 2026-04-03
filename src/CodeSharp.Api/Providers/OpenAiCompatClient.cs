@@ -90,6 +90,7 @@ public class OpenAiCompatClient : IProvider
         using var reader = new StreamReader(stream);
         var messageStopped = false;
         var activeToolCallIndexes = new HashSet<int>();
+        var toolCallStates = new Dictionary<int, ToolCallStreamState>();
         
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -116,7 +117,7 @@ public class OpenAiCompatClient : IProvider
                 yield break;
             }
             
-            foreach (var streamEvent in ParseOpenAiStreamEvents(data, activeToolCallIndexes))
+            foreach (var streamEvent in ParseOpenAiStreamEvents(data, activeToolCallIndexes, toolCallStates))
             {
                 if (streamEvent is StreamEvent.MessageStop)
                 {
@@ -142,23 +143,40 @@ public class OpenAiCompatClient : IProvider
             messages.AddRange(TranslateMessage(msg));
         }
 
+        var tools = request.Tools?.Select(t => new
+        {
+            type = "function",
+            function = new
+            {
+                name = t.Name,
+                description = t.Description,
+                parameters = t.InputSchema
+            }
+        });
+        var toolChoice = request.Tools is not null ? "auto" : null;
+
+        // Newer OpenAI models require max_completion_tokens instead of max_tokens
+        if (_config.ProviderName == "OpenAi")
+        {
+            return new
+            {
+                model = request.Model,
+                messages,
+                max_completion_tokens = request.MaxTokens,
+                stream,
+                tools,
+                tool_choice = toolChoice
+            };
+        }
+
         return new
         {
             model = request.Model,
             messages,
             max_tokens = request.MaxTokens,
             stream,
-            tools = request.Tools?.Select(t => new
-            {
-                type = "function",
-                function = new
-                {
-                    name = t.Name,
-                    description = t.Description,
-                    parameters = t.InputSchema
-                }
-            }),
-            tool_choice = request.Tools is not null ? "auto" : null
+            tools,
+            tool_choice = toolChoice
         };
     }
     
@@ -255,7 +273,11 @@ public class OpenAiCompatClient : IProvider
         }
     }
 
-    private IReadOnlyList<StreamEvent> ParseOpenAiStreamEvents(string data, HashSet<int> activeToolCallIndexes)
+    private IReadOnlyList<StreamEvent> ParseOpenAiStreamEvents(
+        string data,
+        HashSet<int> activeToolCallIndexes,
+        Dictionary<int, ToolCallStreamState> toolCallStates
+    )
     {
         var events = new List<StreamEvent>();
 
@@ -300,12 +322,40 @@ public class OpenAiCompatClient : IProvider
                                 ? argsElement.GetString()
                                 : null;
 
-                            events.Add(new StreamEvent.ContentBlockStart(index, "tool_use", id, name));
+                            if (!toolCallStates.TryGetValue(index, out var state))
+                            {
+                                state = new ToolCallStreamState();
+                                toolCallStates[index] = state;
+                            }
+
+                            var learnedId = !string.IsNullOrEmpty(id) && string.IsNullOrEmpty(state.Id);
+                            var learnedName = !string.IsNullOrEmpty(name) && string.IsNullOrEmpty(state.Name);
+
+                            if (!string.IsNullOrEmpty(id))
+                            {
+                                state.Id = id;
+                            }
+
+                            if (!string.IsNullOrEmpty(name))
+                            {
+                                state.Name = name;
+                            }
+
+                            if (!state.Started || learnedId || learnedName)
+                            {
+                                events.Add(new StreamEvent.ContentBlockStart(index, "tool_use", state.Id, state.Name));
+                                state.Started = true;
+                            }
+
                             activeToolCallIndexes.Add(index);
 
                             if (!string.IsNullOrEmpty(args))
                             {
-                                events.Add(new StreamEvent.ContentBlockDelta(index, new ContentBlockDeltaContent.InputJsonDelta(args)));
+                                var deltaArgs = MergeToolArguments(state, args);
+                                if (!string.IsNullOrEmpty(deltaArgs))
+                                {
+                                    events.Add(new StreamEvent.ContentBlockDelta(index, new ContentBlockDeltaContent.InputJsonDelta(deltaArgs)));
+                                }
                             }
                         }
                     }
@@ -320,6 +370,7 @@ public class OpenAiCompatClient : IProvider
                         foreach (var toolIndex in activeToolCallIndexes.OrderBy(static value => value))
                         {
                             events.Add(new StreamEvent.ContentBlockStop(toolIndex));
+                            toolCallStates.Remove(toolIndex);
                         }
                         activeToolCallIndexes.Clear();
                     }
@@ -348,6 +399,17 @@ public class OpenAiCompatClient : IProvider
         }
         
         return events;
+    }
+
+    private static string MergeToolArguments(ToolCallStreamState state, string incoming)
+    {
+        if (string.IsNullOrEmpty(incoming))
+        {
+            return string.Empty;
+        }
+
+        state.Arguments += incoming;
+        return incoming;
     }
 
     private HttpRequestMessage CreateChatCompletionRequest(string json) => new(HttpMethod.Post, $"{_config.BaseUrl}/chat/completions")
@@ -428,6 +490,17 @@ public class OpenAiCompatClient : IProvider
             _ => finishReason
         };
     }
+}
+
+internal sealed class ToolCallStreamState
+{
+    public string? Id { get; set; }
+
+    public string? Name { get; set; }
+
+    public string Arguments { get; set; } = string.Empty;
+
+    public bool Started { get; set; }
 }
 
 public record OpenAiCompatConfig(

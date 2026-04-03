@@ -1,12 +1,17 @@
 using System.Diagnostics;
+using System.Globalization;
+using System.Net;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Web;
 using CodeSharp.Core;
 
 namespace CodeSharp.Tools;
 
 public class ToolExecutor : IToolExecutor
 {
+    private const int DefaultReadFileLimit = 250;
+
     private readonly GlobalToolRegistry _registry;
     private readonly string _workingDirectory;
     private readonly GitIgnoreMatcher _gitIgnoreMatcher;
@@ -24,7 +29,7 @@ public class ToolExecutor : IToolExecutor
         {
             var jsonInput = JsonSerializer.Deserialize<JsonElement>(input);
             var result = await ExecuteToolAsync(toolName, jsonInput, cancellationToken);
-            return new ToolResult(result);
+            return new ToolResult(result, IsToolErrorResult(result));
         }
         catch (Exception ex)
         {
@@ -68,6 +73,11 @@ public class ToolExecutor : IToolExecutor
         var description = input.TryGetProperty("description", out var descEl) 
             ? descEl.GetString() 
             : null;
+
+        if (TryBuildReadFileRedirectError(command, out var redirectError))
+        {
+            return JsonSerializer.Serialize(new { error = redirectError });
+        }
         
         var startInfo = new ProcessStartInfo
         {
@@ -103,16 +113,56 @@ public class ToolExecutor : IToolExecutor
     private async Task<string> ExecuteReadFileAsync(JsonElement input, CancellationToken cancellationToken)
     {
         var path = input.GetProperty("path").GetString() ?? string.Empty;
-        var offset = input.TryGetProperty("offset", out var offsetEl) ? offsetEl.GetInt32() : 0;
-        var limit = input.TryGetProperty("limit", out var limitEl) ? limitEl.GetInt32() : 2000;
+        var offset = input.TryGetProperty("offset", out var offsetEl) ? Math.Max(0, offsetEl.GetInt32()) : 0;
+        var limit = input.TryGetProperty("limit", out var limitEl) ? Math.Max(1, limitEl.GetInt32()) : DefaultReadFileLimit;
         
         var fullPath = Path.GetFullPath(path, _workingDirectory);
-        var lines = await File.ReadAllLinesAsync(fullPath, cancellationToken);
-        
-        var selectedLines = lines.Skip(offset).Take(limit);
-        var result = selectedLines.Select((line, i) => $"{offset + i + 1}: {line}");
-        
-        return JsonSerializer.Serialize(new { path, lines = result.ToList() });
+        var result = new List<string>(Math.Min(limit, DefaultReadFileLimit));
+        var lineIndex = 0;
+        var hasMore = false;
+
+        using var stream = File.OpenRead(fullPath);
+        using var reader = new StreamReader(stream);
+
+        while (true)
+        {
+            var line = await reader.ReadLineAsync(cancellationToken);
+            if (line is null)
+            {
+                break;
+            }
+
+            if (lineIndex >= offset)
+            {
+                if (result.Count < limit)
+                {
+                    result.Add($"{lineIndex + 1}: {line}");
+                }
+                else
+                {
+                    hasMore = true;
+                    break;
+                }
+            }
+
+            lineIndex++;
+        }
+
+        var linesRead = result.Count;
+        var startLine = linesRead == 0 ? 0 : offset + 1;
+        var endLine = linesRead == 0 ? 0 : offset + linesRead;
+
+        return JsonSerializer.Serialize(new
+        {
+            path,
+            offset,
+            limit,
+            startLine,
+            endLine,
+            lines = result,
+            hasMore,
+            nextOffset = hasMore ? offset + linesRead : (int?)null
+        });
     }
     
     private async Task<string> ExecuteWriteFileAsync(JsonElement input, CancellationToken cancellationToken)
@@ -151,13 +201,18 @@ public class ToolExecutor : IToolExecutor
         
         if (replaceAll)
         {
+            if (!content.Contains(oldString, StringComparison.Ordinal))
+            {
+                throw new ArgumentException(BuildEditMismatchMessage(path, content, oldString));
+            }
+
             content = content.Replace(oldString, newString);
         }
         else
         {
-            var idx = content.IndexOf(oldString);
+            var idx = content.IndexOf(oldString, StringComparison.Ordinal);
             if (idx < 0)
-                throw new ArgumentException("old_string not found in file");
+                throw new ArgumentException(BuildEditMismatchMessage(path, content, oldString));
             content = content.Remove(idx, oldString.Length).Insert(idx, newString);
         }
         
@@ -171,6 +226,45 @@ public class ToolExecutor : IToolExecutor
             preview = preview.Lines,
             previewTruncated = preview.Truncated
         });
+    }
+
+    private static string BuildEditMismatchMessage(string path, string fileContent, string oldString)
+    {
+        // Find the first substantial line of old_string in the file to give the model useful context
+        var firstLine = oldString.Split('\n')
+            .Select(static l => l.Trim())
+            .FirstOrDefault(l => l.Length > 8);
+
+        if (firstLine is not null)
+        {
+            var idx = fileContent.IndexOf(firstLine, StringComparison.Ordinal);
+            if (idx >= 0)
+            {
+                var linesBefore = fileContent[..idx].Split('\n');
+                var anchorLineNum = linesBefore.Length; // 1-based
+                var allLines = fileContent.Split('\n');
+                var startLine = Math.Max(0, anchorLineNum - 3);
+                var contextLines = allLines.Skip(startLine).Take(20).ToList();
+
+                var context = new System.Text.StringBuilder();
+                for (var i = 0; i < contextLines.Count; i++)
+                {
+                    context.AppendLine($"{startLine + i + 1,5}: {contextLines[i]}");
+                }
+
+                return $"old_string not found in file `{path}`. " +
+                       $"The first line of your old_string was found at line {anchorLineNum} but the surrounding content did not match. " +
+                       $"Use this exact content as your new old_string:\n```\n{context.ToString().TrimEnd()}\n```\n" +
+                       "If you cannot make a focused edit, use write_file to replace the entire method instead.";
+            }
+
+            return $"old_string not found in file `{path}` — " +
+                   $"the distinctive line `{firstLine[..Math.Min(60, firstLine.Length)]}` does not appear in the file. " +
+                   "Re-read the file with read_file and use an exact snippet from the current content. " +
+                   "If the method body has changed significantly, use write_file to replace it entirely.";
+        }
+
+        return $"old_string not found in file `{path}`. Re-read this file with read_file and retry with an exact snippet from the current file.";
     }
     
     private string ExecuteGlobSearch(JsonElement input)
@@ -208,9 +302,10 @@ public class ToolExecutor : IToolExecutor
         var caseInsensitive = !input.TryGetProperty("i", out var iEl) || iEl.GetBoolean();
         var limit = input.TryGetProperty("limit", out var limitEl) ? limitEl.GetInt32() : 200;
         
+        var contextLines = input.TryGetProperty("context_lines", out var ctxEl) ? ctxEl.GetInt32() : 2;
         var options = caseInsensitive ? RegexOptions.IgnoreCase : RegexOptions.None;
         var regex = new Regex(pattern, options);
-        
+
         var fullPath = Path.GetFullPath(basePath, _workingDirectory);
         var files = EnumerateSearchFiles(fullPath)
             .Where(file =>
@@ -223,11 +318,11 @@ public class ToolExecutor : IToolExecutor
                 var relativePath = Path.GetRelativePath(fullPath, file).Replace('\\', '/');
                 return GlobMatches(relativePath, glob);
             });
-        
+
         var matches = new List<GrepMatch>();
         var filesWithMatches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var totalMatches = 0;
-        
+
         foreach (var file in files)
         {
             try
@@ -242,10 +337,18 @@ public class ToolExecutor : IToolExecutor
                         filesWithMatches.Add(relativePath);
                         if (matches.Count < limit)
                         {
+                            var before = contextLines > 0
+                                ? lines[Math.Max(0, i - contextLines)..i]
+                                : [];
+                            var after = contextLines > 0
+                                ? lines[(i + 1)..Math.Min(lines.Length, i + 1 + contextLines)]
+                                : [];
                             matches.Add(new GrepMatch(
                                 relativePath,
                                 i + 1,
-                                lines[i].Trim()
+                                lines[i],
+                                before,
+                                after
                             ));
                         }
                     }
@@ -342,43 +445,140 @@ public class ToolExecutor : IToolExecutor
     private async Task<string> ExecuteWebFetchAsync(JsonElement input, CancellationToken cancellationToken)
     {
         var url = input.GetProperty("url").GetString() ?? string.Empty;
-        var prompt = input.GetProperty("prompt").GetString() ?? string.Empty;
-        
+
         using var client = new HttpClient();
         client.Timeout = TimeSpan.FromSeconds(20);
-        
-        var response = await client.GetAsync(url, cancellationToken);
-        var content = await response.Content.ReadAsStringAsync(cancellationToken);
-        
+        client.DefaultRequestHeaders.Add("User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+        client.DefaultRequestHeaders.Add("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8");
+
+        string rawHtml;
+        int statusCode;
+        try
+        {
+            var response = await client.GetAsync(url, cancellationToken);
+            statusCode = (int)response.StatusCode;
+            rawHtml = await response.Content.ReadAsStringAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            return JsonSerializer.Serialize(new { url, error = ex.Message });
+        }
+
+        var text = ExtractReadableText(rawHtml);
+        const int maxChars = 8000;
+        var truncated = text.Length > maxChars;
+
         return JsonSerializer.Serialize(new
         {
             url,
-            statusCode = (int)response.StatusCode,
-            content = content.Length > 1000 ? content[..1000] + "..." : content
+            statusCode,
+            content = truncated ? text[..maxChars] + "\n[truncated]" : text,
+            truncated
         });
+    }
+
+    private static string ExtractReadableText(string html)
+    {
+        // Remove <script>, <style>, <svg>, <head> blocks entirely
+        var blockStrip = new Regex(@"<(script|style|svg|head|noscript|nav|footer|header)[^>]*>.*?</\1>",
+            RegexOptions.Singleline | RegexOptions.IgnoreCase);
+        var cleaned = blockStrip.Replace(html, " ");
+
+        // Strip remaining tags
+        var tagStrip = new Regex(@"<[^>]+>", RegexOptions.Singleline);
+        cleaned = tagStrip.Replace(cleaned, " ");
+
+        // Decode HTML entities
+        cleaned = WebUtility.HtmlDecode(cleaned);
+
+        // Collapse whitespace
+        cleaned = Regex.Replace(cleaned, @"[ \t]+", " ");
+        cleaned = Regex.Replace(cleaned, @"\n\s*\n\s*\n+", "\n\n");
+
+        return cleaned.Trim();
     }
     
     private async Task<string> ExecuteWebSearchAsync(JsonElement input, CancellationToken cancellationToken)
     {
         var query = input.GetProperty("query").GetString() ?? string.Empty;
-        
+        var allowedDomains = ParseStringList(input, "allowed_domains");
+        var blockedDomains = ParseStringList(input, "blocked_domains");
+
         using var client = new HttpClient();
-        var searchUrl = $"https://html.duckduckgo.com/html/?q={Uri.EscapeDataString(query)}";
-        
-        var response = await client.GetStringAsync(searchUrl, cancellationToken);
-        
-        return JsonSerializer.Serialize(new { query, results = new[] { "Web search not fully implemented" } });
+        client.Timeout = TimeSpan.FromSeconds(10);
+        client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (compatible)");
+
+        // DDG Lite is designed for programmatic access — no JS, no bot protection, instant response
+        string html;
+        try
+        {
+            var content = new FormUrlEncodedContent([new KeyValuePair<string, string>("q", query)]);
+            var response = await client.PostAsync("https://lite.duckduckgo.com/lite/", content, cancellationToken);
+            html = await response.Content.ReadAsStringAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            return JsonSerializer.Serialize(new { query, error = $"Search request failed: {ex.Message}" });
+        }
+
+        // DDG Lite structure: <a class="result-link" href="...">Title</a> followed by <td class="result-snippet">
+        var tagStrip = new Regex(@"<[^>]+>", RegexOptions.Singleline);
+        var linkRegex = new Regex(@"<a\s+class=""result-link""\s+href=""([^""]+)""[^>]*>(.*?)</a>", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+        var snippetRegex = new Regex(@"<td\s+class=""result-snippet""[^>]*>(.*?)</td>", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+
+        var linkMatches = linkRegex.Matches(html);
+        var snippetMatches = snippetRegex.Matches(html);
+        var results = new List<object>();
+
+        for (var i = 0; i < linkMatches.Count && results.Count < 8; i++)
+        {
+            var href = WebUtility.HtmlDecode(linkMatches[i].Groups[1].Value.Trim());
+            if (!Uri.TryCreate(href, UriKind.Absolute, out var uri)) continue;
+            if (uri.Scheme is not "http" and not "https") continue;
+
+            var host = uri.Host.ToLowerInvariant();
+            if (blockedDomains.Count > 0 && blockedDomains.Any(d => host == d || host.EndsWith("." + d))) continue;
+            if (allowedDomains.Count > 0 && !allowedDomains.Any(d => host == d || host.EndsWith("." + d))) continue;
+
+            var title = WebUtility.HtmlDecode(tagStrip.Replace(linkMatches[i].Groups[2].Value, "")).Trim();
+            var snippet = i < snippetMatches.Count
+                ? WebUtility.HtmlDecode(tagStrip.Replace(snippetMatches[i].Groups[1].Value, "")).Trim()
+                : string.Empty;
+
+            results.Add(new { title, url = uri.ToString(), snippet, domain = host });
+        }
+
+        return JsonSerializer.Serialize(new { query, resultCount = results.Count, results });
+    }
+
+    private static List<string> ParseStringList(JsonElement input, string property)
+    {
+        if (!input.TryGetProperty(property, out var el) || el.ValueKind != JsonValueKind.Array)
+            return [];
+        return el.EnumerateArray()
+            .Where(static e => e.ValueKind == JsonValueKind.String)
+            .Select(e => (e.GetString() ?? string.Empty).Trim().ToLowerInvariant())
+            .Where(static s => s.Length > 0)
+            .ToList();
     }
     
     private string ExecuteTodoWrite(JsonElement input)
     {
-        var todos = input.GetProperty("todos").EnumerateArray()
-            .Select(t => new TodoItem(
-                t.GetProperty("content").GetString() ?? string.Empty,
-                t.GetProperty("activeForm").GetString() ?? string.Empty,
-                t.GetProperty("status").GetString() ?? "pending"
-            ))
+        if (!input.TryGetProperty("todos", out var todosElement) || todosElement.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException("TodoWrite requires a `todos` array.");
+        }
+
+        var todos = todosElement.EnumerateArray()
+            .Where(static item => item.ValueKind == JsonValueKind.Object)
+            .Select(ParseTodoItem)
             .ToList();
+
+        if (todos.Count == 0)
+        {
+            throw new InvalidOperationException("TodoWrite received no valid todo items.");
+        }
         
         var storePath = Path.Combine(_workingDirectory, ".codesharp-todos.json");
         File.WriteAllText(storePath, JsonSerializer.Serialize(todos));
@@ -577,9 +777,188 @@ public class ToolExecutor : IToolExecutor
         string.IsNullOrEmpty(content)
             ? []
             : content.Replace("\r\n", "\n").Split('\n');
+
+    private static TodoItem ParseTodoItem(JsonElement todo)
+    {
+        var content =
+            JsonString(todo, "content") ??
+            JsonString(todo, "text") ??
+            JsonString(todo, "title") ??
+            string.Empty;
+
+        var activeForm =
+            JsonString(todo, "activeForm") ??
+            JsonString(todo, "active_form") ??
+            JsonString(todo, "active") ??
+            content;
+
+        var status = NormalizeTodoStatus(
+            JsonString(todo, "status") ??
+            JsonString(todo, "state")
+        );
+
+        if (string.IsNullOrWhiteSpace(content) && string.IsNullOrWhiteSpace(activeForm))
+        {
+            throw new InvalidOperationException("Todo item requires at least `content` or `activeForm`.");
+        }
+
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            content = activeForm;
+        }
+
+        if (string.IsNullOrWhiteSpace(activeForm))
+        {
+            activeForm = content;
+        }
+
+        return new TodoItem(content, activeForm, status);
+    }
+
+    private static string NormalizeTodoStatus(string? status) =>
+        status?.Trim().ToLowerInvariant() switch
+        {
+            "pending" => "pending",
+            "in_progress" => "in_progress",
+            "in-progress" => "in_progress",
+            "active" => "in_progress",
+            "completed" => "completed",
+            "complete" => "completed",
+            "done" => "completed",
+            _ => "pending"
+        };
+
+    private static string? JsonString(JsonElement element, string propertyName) =>
+        element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static bool IsToolErrorResult(string output)
+    {
+        try
+        {
+            var json = JsonSerializer.Deserialize<JsonElement>(output);
+            if (json.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            if (json.TryGetProperty("error", out var error) &&
+                error.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(error.GetString()))
+            {
+                return true;
+            }
+
+            if (json.TryGetProperty("exitCode", out var exitCode) &&
+                exitCode.ValueKind == JsonValueKind.Number &&
+                exitCode.TryGetInt32(out var code) &&
+                code != 0)
+            {
+                return true;
+            }
+
+            if (json.TryGetProperty("status", out var status) &&
+                status.ValueKind == JsonValueKind.String &&
+                status.GetString()?.Contains("not fully implemented", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                return true;
+            }
+
+            if (json.TryGetProperty("stderr", out var stderr) &&
+                stderr.ValueKind == JsonValueKind.String &&
+                stderr.GetString()?.Contains("not fully implemented", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                return true;
+            }
+
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool TryBuildReadFileRedirectError(string command, out string error)
+    {
+        error = string.Empty;
+        var trimmed = command.Trim();
+        if (!LooksLikeShellFileInspection(trimmed))
+        {
+            return false;
+        }
+
+        var path = ExtractWorkspacePathFromCommand(trimmed);
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        var displayPath = path.Replace('\\', '/');
+        error = $"Use read_file for file content inspection instead of bash on `{displayPath}`.";
+        return true;
+    }
+
+    private static bool LooksLikeShellFileInspection(string command)
+    {
+        if (string.IsNullOrWhiteSpace(command))
+        {
+            return false;
+        }
+
+        return command.Contains("cat ", StringComparison.Ordinal) ||
+               command.Contains("sed -n", StringComparison.Ordinal) ||
+               command.Contains("head ", StringComparison.Ordinal) ||
+               command.Contains("tail ", StringComparison.Ordinal) ||
+               command.Contains("od ", StringComparison.Ordinal) ||
+               command.Contains("awk ", StringComparison.Ordinal) ||
+               command.Contains("grep ", StringComparison.Ordinal) ||
+               command.Contains("perl -ne", StringComparison.Ordinal);
+    }
+
+    private string? ExtractWorkspacePathFromCommand(string command)
+    {
+        foreach (var token in command.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var candidate = token.Trim().Trim('"', '\'', '(', ')');
+            if (string.IsNullOrWhiteSpace(candidate) || candidate.StartsWith("-", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (!LooksLikePath(candidate))
+            {
+                continue;
+            }
+
+            var fullPath = Path.IsPathRooted(candidate)
+                ? Path.GetFullPath(candidate)
+                : Path.GetFullPath(candidate, _workingDirectory);
+
+            if (!fullPath.StartsWith(_workingDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (File.Exists(fullPath))
+            {
+                return Path.GetRelativePath(_workingDirectory, fullPath);
+            }
+        }
+
+        return null;
+    }
+
+    private static bool LooksLikePath(string token) =>
+        token.StartsWith("/", StringComparison.Ordinal) ||
+        token.StartsWith("./", StringComparison.Ordinal) ||
+        token.StartsWith("../", StringComparison.Ordinal) ||
+        token.Contains('/') ||
+        token.Contains('\\');
 }
 
-internal record GrepMatch(string File, int Line, string Content);
+internal record GrepMatch(string File, int Line, string Content, string[] ContextBefore, string[] ContextAfter);
 internal record TodoItem(string Content, string ActiveForm, string Status);
 internal sealed record DiffPreview(IReadOnlyList<string> Lines, bool Truncated);
 

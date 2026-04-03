@@ -168,7 +168,7 @@ public class GlobalToolRegistry
             },
             PermissionMode.DangerFullAccess
         ),
-        new("read_file", "Read a known text file from the workspace. Prefer glob_search or grep_search first when the target file is not already known.",
+        new("read_file", "Read a paged slice of a known text file from the workspace. Prefer glob_search or grep_search first when the target file is not already known. By default it returns up to 250 lines and includes `hasMore` and `nextOffset` for follow-up reads.",
             new
             {
                 type = "object",
@@ -197,7 +197,7 @@ public class GlobalToolRegistry
             },
             PermissionMode.WorkspaceWrite
         ),
-        new("edit_file", "Replace text in a workspace file.",
+        new("edit_file", "Replace text in a workspace file. `old_string` must match the current file content exactly; if an edit fails, re-read the file with read_file and retry with an exact snippet from the current file.",
             new
             {
                 type = "object",
@@ -412,6 +412,7 @@ public class GlobalToolRegistry
             new
             {
                 type = "object",
+                properties = new { },
                 additionalProperties = true
             },
             PermissionMode.ReadOnly

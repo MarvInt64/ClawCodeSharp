@@ -19,7 +19,11 @@ public class StreamingApiClient : IApiClient
         _tools = tools;
     }
     
-    public async Task<IReadOnlyList<AssistantEvent>> StreamAsync(ApiRequest request, CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<AssistantEvent>> StreamAsync(
+        ApiRequest request,
+        Action<AssistantEvent>? eventSink = null,
+        CancellationToken cancellationToken = default
+    )
     {
         var inputMessages = request.Messages.Select(ConvertMessage).ToList();
         
@@ -40,13 +44,17 @@ public class StreamingApiClient : IApiClient
             switch (streamEvent)
             {
                 case StreamEvent.MessageStart ms:
-                    events.Add(new AssistantEvent.Usage(new TokenUsage(
+                {
+                    var assistantEvent = new AssistantEvent.Usage(new TokenUsage(
                         ms.Usage.InputTokens,
                         ms.Usage.OutputTokens,
                         ms.Usage.CacheCreationInputTokens ?? 0,
                         ms.Usage.CacheReadInputTokens ?? 0
-                    )));
+                    ));
+                    events.Add(assistantEvent);
+                    eventSink?.Invoke(assistantEvent);
                     break;
+                }
                     
                 case StreamEvent.ContentBlockStart cbs:
                     if (cbs.Type == "tool_use")
@@ -74,8 +82,12 @@ public class StreamingApiClient : IApiClient
                     switch (cbd.Delta)
                     {
                         case ContentBlockDeltaContent.TextDelta td:
-                            events.Add(new AssistantEvent.TextDelta(td.Text));
+                        {
+                            var assistantEvent = new AssistantEvent.TextDelta(td.Text);
+                            events.Add(assistantEvent);
+                            eventSink?.Invoke(assistantEvent);
                             break;
+                        }
                         case ContentBlockDeltaContent.InputJsonDelta ijd:
                             if (!toolCalls.TryGetValue(cbd.Index, out var tc))
                             {
@@ -90,23 +102,33 @@ public class StreamingApiClient : IApiClient
                 case StreamEvent.ContentBlockStop cbs:
                     if (toolCalls.TryGetValue(cbs.Index, out var tc2))
                     {
-                        events.Add(new AssistantEvent.ToolUse(tc2.Id, tc2.Name, tc2.Input.ToString()));
+                        var assistantEvent = new AssistantEvent.ToolUse(tc2.Id, tc2.Name, tc2.Input.ToString());
+                        events.Add(assistantEvent);
+                        eventSink?.Invoke(assistantEvent);
                         toolCalls.Remove(cbs.Index);
                     }
                     break;
                     
                 case StreamEvent.MessageDelta md:
-                    events.Add(new AssistantEvent.Usage(new TokenUsage(
+                {
+                    var assistantEvent = new AssistantEvent.Usage(new TokenUsage(
                         md.Usage.InputTokens,
                         md.Usage.OutputTokens,
                         md.Usage.CacheCreationInputTokens ?? 0,
                         md.Usage.CacheReadInputTokens ?? 0
-                    )));
+                    ));
+                    events.Add(assistantEvent);
+                    eventSink?.Invoke(assistantEvent);
                     break;
+                }
                     
                 case StreamEvent.MessageStop:
-                    events.Add(new AssistantEvent.MessageStop());
+                {
+                    var assistantEvent = new AssistantEvent.MessageStop();
+                    events.Add(assistantEvent);
+                    eventSink?.Invoke(assistantEvent);
                     break;
+                }
             }
         }
         
