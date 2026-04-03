@@ -48,11 +48,11 @@ internal static class ConsoleUi
 
     public static string Error(string text) => Paint(text, "38;5;203");
 
-    public static string DiffAdded(string text) => Paint(text, "38;5;42");
+    public static string DiffAdded(string text) => Paint(text, "38;5;157;48;5;22");
 
-    public static string DiffRemoved(string text) => Paint(text, "38;5;203");
+    public static string DiffRemoved(string text) => Paint(text, "38;5;224;48;5;52");
 
-    public static string DiffHunk(string text) => Paint(text, "38;5;117");
+    public static string DiffHunk(string text) => Paint(text, "38;5;153;48;5;24");
 
     public static string AssistantPlan(string text) => $"{AccentBadge(" PLAN ")} {Strong(text)}";
 

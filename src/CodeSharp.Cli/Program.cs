@@ -973,8 +973,8 @@ Add any additional context about the project.
         return toolName switch
         {
             "read_file" => DescribeReadFileFinish(payload, fallbackDescription),
-            "write_file" => isError ? $"failed writing {path}" : $"wrote {path}",
-            "edit_file" => isError ? $"failed editing {path}" : $"edited {path}",
+            "write_file" => isError ? $"failed writing {path}" : DescribeDiffFinish("wrote", path, payload),
+            "edit_file" => isError ? $"failed editing {path}" : DescribeDiffFinish("edited", path, payload),
             "auto_verify" => DescribeAutoVerifyFinish(payload, fallbackDescription, isError),
             "find_symbol" => DescribeSearchSummaryFinish(payload, fallbackDescription, "totalMatches"),
             "find_references" => DescribeSearchSummaryFinish(payload, fallbackDescription, "totalReferences"),
@@ -1050,7 +1050,7 @@ Add any additional context about the project.
         if (json.TryGetProperty("previewTruncated", out var truncated) &&
             truncated.ValueKind == JsonValueKind.True)
         {
-            lines.Add("... diff preview truncated");
+            lines.Add("… diff preview truncated");
         }
 
         return lines.Count == 0 ? null : lines;
@@ -1150,6 +1150,18 @@ Add any additional context about the project.
 
         return $"{label} passed";
     }
+
+    private static string DescribeDiffFinish(string verb, string path, JsonElement? payload)
+    {
+        var added = JsonInt(payload, "linesAdded");
+        var removed = JsonInt(payload, "linesRemoved");
+        return added is null && removed is null
+            ? $"{verb} {path}"
+            : $"{verb} {path} ({FormatSignedCount(added, '+')} {FormatSignedCount(removed, '-')})";
+    }
+
+    private static string FormatSignedCount(int? value, char prefix) =>
+        value is null ? $"{prefix}0" : $"{prefix}{value.Value:N0}";
 
     private static string DescribeSearchSummaryFinish(JsonElement? payload, string fallbackDescription, string countProperty)
     {

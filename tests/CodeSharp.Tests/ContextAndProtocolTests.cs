@@ -296,6 +296,114 @@ version = "0.1.0"
         Assert.Equal(ProviderKind.OpenAi, ProviderAccessWorkflow.ResolveProviderKind("moonshotai/kimi-k2.5", ProviderKind.OpenAi));
     }
 
+    [Fact]
+    public async Task RunTurnAsync_RunsAutomaticVerificationOnceAtTurnEnd()
+    {
+        var workspace = Path.Combine(Path.GetTempPath(), $"codesharp-tests-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workspace);
+        File.WriteAllText(Path.Combine(workspace, "Demo.sln"), string.Empty);
+        var originalCwd = Directory.GetCurrentDirectory();
+
+        try
+        {
+            Directory.SetCurrentDirectory(workspace);
+
+            var api = new FakeApiClient(
+                new[]
+                {
+                    new AssistantEvent[]
+                    {
+                        new AssistantEvent.TextDelta("I will write the file."),
+                        new AssistantEvent.ToolUse("tool-1", "write_file", """{"path":"Program.cs","content":"class Program {}"}"""),
+                        new AssistantEvent.MessageStop()
+                    },
+                    new[]
+                    {
+                        new AssistantEvent.TextDelta("The edit is done."),
+                        new AssistantEvent.MessageStop()
+                    },
+                    new[]
+                    {
+                        new AssistantEvent.TextDelta("Verification passed."),
+                        new AssistantEvent.MessageStop()
+                    }
+                });
+
+            var tools = new FakeToolExecutor();
+            var runtime = new ConversationRuntime(
+                Session.New(),
+                api,
+                tools,
+                new PermissionPolicy(
+                    PermissionMode.DangerFullAccess,
+                    new Dictionary<string, PermissionMode>
+                    {
+                        ["write_file"] = PermissionMode.WorkspaceWrite,
+                        ["bash"] = PermissionMode.DangerFullAccess
+                    }),
+                ["You are CodeSharp."],
+                PermissionMode.DangerFullAccess,
+                AutoVerifyMode.On
+            );
+
+            var summary = await runtime.RunTurnAsync("make the change");
+
+            Assert.Equal(3, api.Requests.Count);
+            Assert.Equal(["write_file", "bash"], tools.ExecutedTools);
+            Assert.Contains(runtime.Session.Messages, message =>
+                message.Role == MessageRole.User &&
+                GetText(message).Contains("[Runtime verification note]", StringComparison.Ordinal));
+            Assert.Equal("Verification passed.", ExtractLatestAssistantText(summary));
+        }
+        finally
+        {
+            Directory.SetCurrentDirectory(originalCwd);
+        }
+    }
+
+    [Fact]
+    public async Task EditFile_ReturnsDiffCountsAndHeadTailPreview()
+    {
+        var workspace = Path.Combine(Path.GetTempPath(), $"codesharp-tests-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workspace);
+        var filePath = Path.Combine(workspace, "Example.cs");
+        var original = string.Join("\n", Enumerable.Range(1, 30).Select(i => $"line {i}"));
+        await File.WriteAllTextAsync(filePath, original);
+
+        var replacement = string.Join("\n", Enumerable.Range(1, 24).Select(i => $"replacement {i}"));
+        var executor = new ToolExecutor(new GlobalToolRegistry(), workspace);
+        var result = await executor.ExecuteAsync(
+            "edit_file",
+            JsonSerializer.Serialize(new
+            {
+                path = "Example.cs",
+                old_string = original,
+                new_string = replacement
+            }));
+
+        using var document = JsonDocument.Parse(result.Output);
+        Assert.Equal(24, document.RootElement.GetProperty("linesAdded").GetInt32());
+        Assert.Equal(30, document.RootElement.GetProperty("linesRemoved").GetInt32());
+        Assert.True(document.RootElement.GetProperty("previewTruncated").GetBoolean());
+
+        var preview = document.RootElement.GetProperty("preview").EnumerateArray().Select(x => x.GetString()).ToList();
+        Assert.Contains("… 34 more diff lines …", preview);
+        Assert.Contains("+ replacement 24", preview);
+    }
+
+    [Fact]
+    public void DescribeToolFinish_IncludesDiffCountsForFileEdits()
+    {
+        var description = Program.DescribeToolFinish(
+            "edit_file",
+            """{"path":"src/App.cs","linesAdded":13,"linesRemoved":9,"preview":["@@ -1,1 +1,1 @@"]}""",
+            "editing src/App.cs",
+            false
+        );
+
+        Assert.Equal("edited src/App.cs (+13 -9)", description);
+    }
+
     private static string GetText(ConversationMessage message) =>
         string.Join(
             "\n",
@@ -303,4 +411,51 @@ version = "0.1.0"
                 .OfType<ContentBlock.Text>()
                 .Select(static block => block.Content)
         );
+
+    private static string ExtractLatestAssistantText(TurnSummary summary) =>
+        summary.AssistantMessages
+            .Select(GetText)
+            .Last();
+
+    private sealed class FakeApiClient(IEnumerable<IReadOnlyList<AssistantEvent>> responses) : IApiClient
+    {
+        private readonly Queue<IReadOnlyList<AssistantEvent>> _responses = new(responses);
+
+        public List<ApiRequest> Requests { get; } = [];
+
+        public Task<IReadOnlyList<AssistantEvent>> StreamAsync(
+            ApiRequest request,
+            Action<AssistantEvent>? eventSink = null,
+            CancellationToken cancellationToken = default
+        )
+        {
+            Requests.Add(request);
+            var response = _responses.Dequeue();
+            if (eventSink is not null)
+            {
+                foreach (var assistantEvent in response)
+                {
+                    eventSink(assistantEvent);
+                }
+            }
+
+            return Task.FromResult(response);
+        }
+    }
+
+    private sealed class FakeToolExecutor : IToolExecutor
+    {
+        public List<string> ExecutedTools { get; } = [];
+
+        public Task<ToolResult> ExecuteAsync(string toolName, string input, CancellationToken cancellationToken = default)
+        {
+            ExecutedTools.Add(toolName);
+            return toolName switch
+            {
+                "write_file" => Task.FromResult(new ToolResult("""{"path":"Program.cs","linesWritten":1,"preview":["+class Program {}"],"previewTruncated":false}""")),
+                "bash" => Task.FromResult(new ToolResult("""{"stdout":"Build succeeded.","stderr":"","exitCode":0}""")),
+                _ => throw new InvalidOperationException($"Unexpected tool: {toolName}")
+            };
+        }
+    }
 }

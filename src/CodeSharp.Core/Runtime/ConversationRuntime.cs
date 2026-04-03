@@ -83,6 +83,8 @@ public class ConversationRuntime
         
         var assistantMessages = new List<ConversationMessage>();
         var toolResults = new List<ConversationMessage>();
+        var mutatedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var automaticVerificationCompleted = false;
         var iterations = 0;
         
         while (true)
@@ -141,11 +143,20 @@ public class ConversationRuntime
             
             if (pendingToolUses.Count == 0)
             {
+                if (!automaticVerificationCompleted &&
+                    await TryRunAutomaticVerificationAsync(mutatedPaths, prompter, activitySink, cancellationToken) is { } verificationMessage)
+                {
+                    automaticVerificationCompleted = true;
+                    _session.AddMessage(verificationMessage);
+                    continue;
+                }
+
                 break;
             }
 
             var iterationResults = await ExecutePendingToolUsesAsync(
                 pendingToolUses,
+                mutatedPaths,
                 prompter,
                 activitySink,
                 cancellationToken
@@ -189,6 +200,7 @@ public class ConversationRuntime
 
     private async Task<IReadOnlyList<ConversationMessage>> ExecutePendingToolUsesAsync(
         IReadOnlyList<(string ToolUseId, string ToolName, string Input)> pendingToolUses,
+        ISet<string> mutatedPaths,
         IPermissionPrompter? prompter,
         Action<RuntimeActivity>? activitySink,
         CancellationToken cancellationToken
@@ -196,7 +208,6 @@ public class ConversationRuntime
     {
         var results = new ConversationMessage[pendingToolUses.Count];
         var parallelBatch = new List<PreparedToolExecution>();
-        var mutatedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         for (var index = 0; index < pendingToolUses.Count; index++)
         {
@@ -239,14 +250,7 @@ public class ConversationRuntime
         }
 
         await FlushParallelBatchAsync(parallelBatch, results, cancellationToken);
-
-        var messages = results.ToList();
-        if (await TryRunAutomaticVerificationAsync(mutatedPaths, prompter, activitySink, cancellationToken) is { } verificationMessage)
-        {
-            messages.Add(verificationMessage);
-        }
-
-        return messages;
+        return results;
     }
 
     private async Task<PreparedToolExecution> PrepareToolExecutionAsync(

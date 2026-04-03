@@ -229,6 +229,8 @@ public class ToolExecutor : IToolExecutor
         {
             path,
             linesWritten = content.Split('\n').Length,
+            linesAdded = preview.AddedCount,
+            linesRemoved = preview.RemovedCount,
             preview = preview.Lines,
             previewTruncated = preview.Truncated
         });
@@ -269,6 +271,8 @@ public class ToolExecutor : IToolExecutor
         {
             path,
             edited = true,
+            linesAdded = preview.AddedCount,
+            linesRemoved = preview.RemovedCount,
             preview = preview.Lines,
             previewTruncated = preview.Truncated
         });
@@ -864,7 +868,7 @@ public class ToolExecutor : IToolExecutor
         return Regex.IsMatch(input, $"^{regexPattern}$", RegexOptions.IgnoreCase);
     }
 
-    private static DiffPreview BuildDiffPreview(string? oldContent, string newContent, int maxPreviewLines = 12)
+    private static DiffPreview BuildDiffPreview(string? oldContent, string newContent, int maxPreviewLines = 22)
     {
         var oldLines = SplitLines(oldContent);
         var newLines = SplitLines(newContent);
@@ -889,10 +893,12 @@ public class ToolExecutor : IToolExecutor
 
         var removed = oldSuffix >= prefix ? oldLines[prefix..(oldSuffix + 1)] : [];
         var added = newSuffix >= prefix ? newLines[prefix..(newSuffix + 1)] : [];
+        var removedCount = removed.Length;
+        var addedCount = added.Length;
 
         if (removed.Length == 0 && added.Length == 0)
         {
-            return new DiffPreview([], false);
+            return new DiffPreview([], false, 0, 0);
         }
 
         var startLine = prefix + 1;
@@ -907,11 +913,19 @@ public class ToolExecutor : IToolExecutor
         var truncated = false;
         if (previewLines.Count > maxPreviewLines)
         {
-            previewLines = [.. previewLines.Take(maxPreviewLines)];
+            const int headCount = 12;
+            const int tailCount = 8;
+            var hiddenCount = previewLines.Count - (headCount + tailCount + 1);
+            previewLines =
+            [
+                .. previewLines.Take(headCount),
+                $"… {hiddenCount} more diff lines …",
+                .. previewLines.TakeLast(tailCount)
+            ];
             truncated = true;
         }
 
-        return new DiffPreview(previewLines, truncated);
+        return new DiffPreview(previewLines, truncated, addedCount, removedCount);
     }
 
     private static string[] SplitLines(string? content) =>
@@ -1101,7 +1115,7 @@ public class ToolExecutor : IToolExecutor
 
 internal record GrepMatch(string File, int Line, string Content, string[] ContextBefore, string[] ContextAfter);
 internal record TodoItem(string Content, string ActiveForm, string Status);
-internal sealed record DiffPreview(IReadOnlyList<string> Lines, bool Truncated);
+internal sealed record DiffPreview(IReadOnlyList<string> Lines, bool Truncated, int AddedCount, int RemovedCount);
 internal sealed record TruncatedProcessOutput(string Content, bool Truncated, int OriginalLength);
 
 internal sealed class GitIgnoreMatcher
