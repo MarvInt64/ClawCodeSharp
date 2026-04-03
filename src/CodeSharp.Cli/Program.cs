@@ -970,6 +970,8 @@ Add any additional context about the project.
             "read_file" => DescribeReadFileFinish(payload, fallbackDescription),
             "write_file" => isError ? $"failed writing {path}" : $"wrote {path}",
             "edit_file" => isError ? $"failed editing {path}" : $"edited {path}",
+            "bash" => DescribeShellCommandFinish(payload, fallbackDescription, isError),
+            "PowerShell" => DescribeShellCommandFinish(payload, fallbackDescription, isError),
             "TodoWrite" => isError ? "failed updating plan" : fallbackDescription,
             _ => fallbackDescription
         };
@@ -999,6 +1001,11 @@ Add any additional context about the project.
         if (toolName == "read_file")
         {
             return ExtractReadFilePreviewLines(payload);
+        }
+
+        if (toolName is "bash" or "PowerShell")
+        {
+            return ExtractShellPreviewLines(payload);
         }
 
         if (toolName is not ("write_file" or "edit_file"))
@@ -1069,6 +1076,70 @@ Add any additional context about the project.
             .Split('\n')
             .Select(line => line.Length <= maxLength ? line : $"{line[..(maxLength - 1)]}…")
             .ToList();
+    }
+
+    private static string DescribeShellCommandFinish(JsonElement? payload, string fallbackDescription, bool isError)
+    {
+        var exitCode = JsonInt(payload, "exitCode");
+        if (isError)
+        {
+            return exitCode is { } code
+                ? $"{fallbackDescription} failed (exit {code})"
+                : $"{fallbackDescription} failed";
+        }
+
+        return exitCode is { } successCode && successCode != 0
+            ? $"{fallbackDescription} finished (exit {successCode})"
+            : fallbackDescription;
+    }
+
+    private static IReadOnlyList<string>? ExtractShellPreviewLines(JsonElement? payload)
+    {
+        if (payload is not { ValueKind: JsonValueKind.Object } json)
+        {
+            return null;
+        }
+
+        var lines = new List<string>();
+        AppendShellStreamPreview(lines, json, "stdout", "stdout");
+        AppendShellStreamPreview(lines, json, "stderr", "stderr");
+
+        var exitCode = JsonInt(payload, "exitCode");
+        if (exitCode is { } code)
+        {
+            lines.Add($"exit code: {code}");
+        }
+
+        return lines.Count == 0 ? null : lines;
+    }
+
+    private static void AppendShellStreamPreview(List<string> lines, JsonElement payload, string propertyName, string label)
+    {
+        if (!payload.TryGetProperty(propertyName, out var value) || value.ValueKind != JsonValueKind.String)
+        {
+            return;
+        }
+
+        var text = value.GetString()?.Replace("\r\n", "\n").Trim();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        const int maxLines = 12;
+        const int maxLineLength = 160;
+
+        var streamLines = text.Split('\n');
+        lines.Add($"{label}:");
+        foreach (var line in streamLines.Take(maxLines))
+        {
+            lines.Add(line.Length <= maxLineLength ? line : $"{line[..(maxLineLength - 1)]}…");
+        }
+
+        if (streamLines.Length > maxLines)
+        {
+            lines.Add($"... {streamLines.Length - maxLines} more {label} lines");
+        }
     }
 
     private static string? JsonString(JsonElement? payload, string propertyName)
