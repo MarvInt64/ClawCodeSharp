@@ -209,26 +209,3 @@ codesharp config unset model
 | `--output` | Output format: text, json |
 | `--version` | Show version |
 | `--help` | Show help |
-
-
-## Architecture
-
-The C# implementation follows the same architecture as the Rust version:
-
-- **CodeSharp.Core**: Core types (Session, ContentBlock, TokenUsage), runtime (ConversationRuntime), permissions (PermissionPolicy), and usage tracking.
-- **CodeSharp.Api**: API client abstraction, provider implementations (CodeSharpApi/Anthropic, OpenAI, xAI, NVIDIA).
-- **CodeSharp.Tools**: Built-in tool definitions (bash, read_file, write_file, etc.) and execution logic.
-- **CodeSharp.Plugins**: Plugin manifest parsing and tool aggregation.
-- **CodeSharp.Lsp**: Language Server Protocol client for code intelligence.
-- **CodeSharp.Commands**: Slash command parsing and handlers.
-- **CodeSharp.Cli**: Main entry point, argument parsing, REPL loop.
-- **CodeSharp.Server**: HTTP server for session management via REST API.
-
-## Differences from Rust
-
-- Uses `System.Text.Json` for serialization instead of `serde_json`
-- Uses `HttpClient` for HTTP requests instead of `reqwest`
-- Uses `HttpListener` for the HTTP server instead of `axum`
-- Async/await pattern throughout using `Task` and `CancellationToken`
-- Record types for immutable data structures
-- Extension methods for enums
