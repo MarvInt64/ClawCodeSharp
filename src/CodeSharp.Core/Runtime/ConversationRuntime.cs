@@ -7,11 +7,15 @@ public record ConversationRuntimeCheckpoint(int MessageCount, UsageTrackerSnapsh
 
 public class ConversationRuntime
 {
+    private const int AutoVerifyTimeoutMs = 120_000;
+
     private static readonly HashSet<string> ParallelSafeTools = new(StringComparer.Ordinal)
     {
         "read_file",
         "glob_search",
-        "grep_search"
+        "grep_search",
+        "find_symbol",
+        "find_references"
     };
 
     private static readonly HashSet<string> MutatingFileTools = new(StringComparer.Ordinal)
@@ -24,6 +28,8 @@ public class ConversationRuntime
     private readonly IApiClient _apiClient;
     private readonly IToolExecutor _toolExecutor;
     private readonly PermissionPolicy _permissionPolicy;
+    private readonly PermissionMode _permissionMode;
+    private readonly AutoVerifyMode _autoVerifyMode;
     private readonly IReadOnlyList<string> _systemPrompt;
     private readonly UsageTracker _usageTracker;
     private readonly HookRunner _hookRunner;
@@ -37,6 +43,8 @@ public class ConversationRuntime
         IToolExecutor toolExecutor,
         PermissionPolicy permissionPolicy,
         IReadOnlyList<string> systemPrompt,
+        PermissionMode permissionMode,
+        AutoVerifyMode autoVerifyMode = AutoVerifyMode.DangerOnly,
         int maxIterations = int.MaxValue
     )
     {
@@ -44,6 +52,8 @@ public class ConversationRuntime
         _apiClient = apiClient;
         _toolExecutor = toolExecutor;
         _permissionPolicy = permissionPolicy;
+        _permissionMode = permissionMode;
+        _autoVerifyMode = autoVerifyMode;
         _systemPrompt = systemPrompt;
         _maxIterations = maxIterations;
         _usageTracker = UsageTracker.FromSession(session);
@@ -230,7 +240,13 @@ public class ConversationRuntime
 
         await FlushParallelBatchAsync(parallelBatch, results, cancellationToken);
 
-        return results;
+        var messages = results.ToList();
+        if (await TryRunAutomaticVerificationAsync(mutatedPaths, prompter, activitySink, cancellationToken) is { } verificationMessage)
+        {
+            messages.Add(verificationMessage);
+        }
+
+        return messages;
     }
 
     private async Task<PreparedToolExecution> PrepareToolExecutionAsync(
@@ -325,6 +341,87 @@ public class ConversationRuntime
 
     private static bool IsParallelSafeTool(string toolName) => ParallelSafeTools.Contains(toolName);
 
+    private async Task<ConversationMessage?> TryRunAutomaticVerificationAsync(
+        IReadOnlyCollection<string> mutatedPaths,
+        IPermissionPrompter? prompter,
+        Action<RuntimeActivity>? activitySink,
+        CancellationToken cancellationToken
+    )
+    {
+        if (!ShouldRunAutomaticVerification() || mutatedPaths.Count == 0)
+        {
+            return null;
+        }
+
+        var workingDirectory = Directory.GetCurrentDirectory();
+        var plan = AutoVerifyPlanner.TryCreate(workingDirectory, mutatedPaths);
+        if (plan is null)
+        {
+            return null;
+        }
+
+        var toolUseId = $"auto-verify-{Guid.NewGuid():N}";
+        var activityInput = JsonSerializer.Serialize(new
+        {
+            command = plan.Command,
+            strategy = plan.Strategy,
+            mutatedPaths = plan.MutatedPaths.Select(DisplayPath).ToArray()
+        });
+
+        var bashInput = JsonSerializer.Serialize(new
+        {
+            command = plan.Command,
+            description = plan.Description,
+            timeout = AutoVerifyTimeoutMs
+        });
+
+        var permissionResult = ShouldPromptForAutomaticVerification()
+            ? _permissionPolicy.Authorize("bash", bashInput, prompter)
+            : PermissionResult.Allowed;
+
+        if (permissionResult.Outcome != PermissionOutcome.Allow)
+        {
+            activitySink?.Invoke(new RuntimeActivity.ToolStarted(toolUseId, "auto_verify", activityInput));
+            activitySink?.Invoke(new RuntimeActivity.ToolBlocked(
+                toolUseId,
+                "auto_verify",
+                permissionResult.Reason ?? "Permission denied"
+            ));
+
+            return ConversationMessage.UserText(
+                BuildAutoVerifySystemNote(
+                    plan,
+                    status: "skipped",
+                    summary: permissionResult.Reason ?? "Permission denied",
+                    exitCode: null
+                )
+            );
+        }
+
+        activitySink?.Invoke(new RuntimeActivity.ToolStarted(toolUseId, "auto_verify", activityInput));
+        var (output, isError) = await ExecuteToolWithErrorHandlingAsync("bash", bashInput, cancellationToken);
+        var (summary, exitCode, previewLines) = SummarizeShellVerification(output, isError);
+        var activityOutput = JsonSerializer.Serialize(new
+        {
+            command = plan.Command,
+            strategy = plan.Strategy,
+            exitCode,
+            status = isError ? "failed" : "passed",
+            preview = previewLines,
+            mutatedPaths = plan.MutatedPaths.Select(DisplayPath).ToArray()
+        });
+        activitySink?.Invoke(new RuntimeActivity.ToolFinished(toolUseId, "auto_verify", activityOutput, isError));
+
+        return ConversationMessage.UserText(
+            BuildAutoVerifySystemNote(
+                plan,
+                status: isError ? "failed" : "passed",
+                summary,
+                exitCode
+            )
+        );
+    }
+
     private string? TryGetMutatingToolPath(string toolName, string input)
     {
         if (!MutatingFileTools.Contains(toolName))
@@ -355,6 +452,135 @@ public class ConversationRuntime
         message.Blocks
             .OfType<ContentBlock.ToolResult>()
             .Any(block => !block.IsError);
+
+    private bool ShouldRunAutomaticVerification() =>
+        _autoVerifyMode switch
+        {
+            AutoVerifyMode.Off => false,
+            AutoVerifyMode.DangerOnly => _permissionMode == PermissionMode.DangerFullAccess,
+            AutoVerifyMode.On => true,
+            _ => false
+        };
+
+    private bool ShouldPromptForAutomaticVerification() =>
+        _permissionMode != PermissionMode.DangerFullAccess || _autoVerifyMode == AutoVerifyMode.On;
+
+    private static string BuildAutoVerifySystemNote(
+        AutoVerifyPlan plan,
+        string status,
+        string summary,
+        int? exitCode
+    )
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("[Runtime verification note]");
+        builder.AppendLine(status == "skipped"
+            ? "Automatic verification was skipped after file edits."
+            : "Automatic verification ran after file edits.");
+        builder.AppendLine($"Strategy: {plan.Strategy}");
+        builder.AppendLine($"Command: {plan.Command}");
+        builder.AppendLine($"Status: {status}");
+        if (exitCode is not null)
+        {
+            builder.AppendLine($"Exit code: {exitCode}");
+        }
+
+        var mutatedPaths = plan.MutatedPaths
+            .Select(DisplayPath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(8)
+            .ToList();
+
+        if (mutatedPaths.Count > 0)
+        {
+            builder.AppendLine($"Files: {string.Join(", ", mutatedPaths)}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(summary))
+        {
+            builder.AppendLine("Summary:");
+            builder.AppendLine(summary.Trim());
+        }
+
+        builder.AppendLine("Use this as diagnostic context, not as a new user request.");
+
+        return builder.ToString().TrimEnd();
+    }
+
+    private static (string Summary, int? ExitCode, IReadOnlyList<string> PreviewLines) SummarizeShellVerification(
+        string output,
+        bool isError
+    )
+    {
+        try
+        {
+            var json = JsonSerializer.Deserialize<JsonElement>(output);
+            if (json.ValueKind != JsonValueKind.Object)
+            {
+                return (Clip(output, 1200), null, WrapPreviewLines(output));
+            }
+
+            var exitCode = json.TryGetProperty("exitCode", out var exitCodeValue) &&
+                           exitCodeValue.ValueKind == JsonValueKind.Number &&
+                           exitCodeValue.TryGetInt32(out var parsedExitCode)
+                ? parsedExitCode
+                : (int?)null;
+
+            var summary = json.TryGetProperty("error", out var error) &&
+                          error.ValueKind == JsonValueKind.String &&
+                          !string.IsNullOrWhiteSpace(error.GetString())
+                ? error.GetString() ?? string.Empty
+                : FirstNonEmpty(
+                    JsonString(json, "stderr"),
+                    JsonString(json, "stdout"),
+                    isError ? output : "Verification passed."
+                );
+
+            var preview = WrapPreviewLines(
+                FirstNonEmpty(JsonString(json, "stderr"), JsonString(json, "stdout"), summary)
+            );
+
+            return (Clip(summary, 1200), exitCode, preview);
+        }
+        catch
+        {
+            return (Clip(output, 1200), null, WrapPreviewLines(output));
+        }
+    }
+
+    private static string? JsonString(JsonElement element, string propertyName) =>
+        element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static string FirstNonEmpty(params string?[] values) =>
+        values.FirstOrDefault(static value => !string.IsNullOrWhiteSpace(value)) ?? string.Empty;
+
+    private static IReadOnlyList<string> WrapPreviewLines(string text)
+    {
+        var normalized = text.Replace("\r\n", "\n").Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return [];
+        }
+
+        return normalized
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Take(6)
+            .Select(line => Clip(line, 160))
+            .ToList();
+    }
+
+    private static string Clip(string text, int maxChars)
+    {
+        var normalized = text.Replace("\r\n", "\n").Trim();
+        if (normalized.Length <= maxChars)
+        {
+            return normalized;
+        }
+
+        return $"{normalized[..Math.Max(0, maxChars - 1)]}…";
+    }
 
     private static string DisplayPath(string fullPath)
     {

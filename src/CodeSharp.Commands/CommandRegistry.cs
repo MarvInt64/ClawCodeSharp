@@ -4,7 +4,8 @@ public record SlashCommandSpec(
     string Name,
     IReadOnlyList<string> Aliases,
     string Description,
-    bool IsResumeSafe = false
+    bool IsResumeSafe = false,
+    bool ShowInRepl = true
 );
 
 public class CommandRegistry
@@ -17,6 +18,9 @@ public class CommandRegistry
     }
     
     public IReadOnlyList<SlashCommandSpec> Commands => _commands;
+
+    public IReadOnlyList<SlashCommandSpec> VisibleCommands =>
+        _commands.Where(static c => c.ShowInRepl).ToList();
     
     public SlashCommandSpec? GetCommand(string name)
     {
@@ -27,7 +31,7 @@ public class CommandRegistry
     
     public IEnumerable<string> GetCompletionCandidates()
     {
-        foreach (var cmd in _commands)
+        foreach (var cmd in VisibleCommands)
         {
             yield return $"/{cmd.Name}";
             foreach (var alias in cmd.Aliases)
@@ -46,26 +50,28 @@ public class CommandRegistry
         new("permissions", [], "Show or switch permission mode"),
         new("cost", [], "Show token usage", true),
         new("clear", [], "Clear session history"),
-        new("resume", [], "Resume a previous session"),
+        new("resume", [], "Resume a previous session", ShowInRepl: false),
         new("export", [], "Export session transcript", true),
-        new("session", [], "Manage sessions"),
+        new("session", [], "Manage sessions", ShowInRepl: false),
         new("config", [], "View or edit global provider/model/API key defaults", true),
-        new("memory", [], "View memory file contents", true),
-        new("init", [], "Initialize .codesharp configuration", true),
+        new("memory", [], "View memory file contents", true, ShowInRepl: false),
+        new("init", [], "Initialize .codesharp configuration", true, ShowInRepl: false),
         new("diff", [], "Show uncommitted changes", true),
+        new("symbols", ["symbol", "sym"], "Find symbol declarations in the workspace", true),
+        new("refs", ["references"], "Find symbol references in the workspace", true),
         new("version", ["v"], "Show version", true),
-        new("agents", [], "List available agents", true),
-        new("skills", [], "List available skills", true),
-        new("plugins", [], "Manage plugins"),
-        new("bughunter", [], "Run bug hunting agent"),
-        new("branch", [], "Create and switch to new branch"),
-        new("worktree", [], "Create a new git worktree"),
+        new("agents", [], "List available agents", true, ShowInRepl: false),
+        new("skills", [], "List available skills", true, ShowInRepl: false),
+        new("plugins", [], "Manage plugins", ShowInRepl: false),
+        new("bughunter", [], "Run bug hunting agent", ShowInRepl: false),
+        new("branch", [], "Create and switch to new branch", ShowInRepl: false),
+        new("worktree", [], "Create a new git worktree", ShowInRepl: false),
         new("commit", [], "Create a git commit"),
-        new("pr", [], "Create a pull request"),
-        new("issue", [], "Create a GitHub issue"),
-        new("commit-push-pr", ["cpp"], "Commit, push, and create PR"),
-        new("ultraplan", [], "Generate detailed implementation plan"),
-        new("teleport", [], "Jump to a different directory"),
-        new("debug-tool-call", [], "Debug tool execution")
+        new("pr", [], "Create a pull request", ShowInRepl: false),
+        new("issue", [], "Create a GitHub issue", ShowInRepl: false),
+        new("commit-push-pr", ["cpp"], "Commit, push, and create PR", ShowInRepl: false),
+        new("ultraplan", [], "Generate detailed implementation plan", ShowInRepl: false),
+        new("teleport", [], "Jump to a different directory", ShowInRepl: false),
+        new("debug-tool-call", [], "Debug tool execution", ShowInRepl: false)
     ];
 }

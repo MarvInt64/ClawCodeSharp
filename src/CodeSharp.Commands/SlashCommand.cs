@@ -16,6 +16,8 @@ public enum SlashCommandKind
     Memory,
     Init,
     Diff,
+    Symbols,
+    References,
     Version,
     Agents,
     Skills,
@@ -88,6 +90,16 @@ public record SlashCommand
     public static SlashCommand Memory => new() { Kind = SlashCommandKind.Memory };
     public static SlashCommand Init => new() { Kind = SlashCommandKind.Init };
     public static SlashCommand Diff => new() { Kind = SlashCommandKind.Diff };
+    public static SlashCommand Symbols(string? args = null) => new()
+    {
+        Kind = SlashCommandKind.Symbols,
+        Args = args
+    };
+    public static SlashCommand References(string? args = null) => new()
+    {
+        Kind = SlashCommandKind.References,
+        Args = args
+    };
     
     public static SlashCommand Agents(string? args = null) => new()
     {
@@ -147,6 +159,8 @@ public record SlashCommand
             "memory" => Memory,
             "init" => Init,
             "diff" => Diff,
+            "symbols" or "symbol" or "sym" => Symbols(args),
+            "refs" or "references" => References(args),
             "version" or "v" => Version,
             "agents" => Agents(args),
             "skills" => Skills(args),

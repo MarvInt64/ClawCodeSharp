@@ -10,6 +10,9 @@
     <ToolCommandName>codesharp</ToolCommandName>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="CodeSharp.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\CodeSharp.Core\CodeSharp.Core.csproj" />
     <ProjectReference Include="..\CodeSharp.Api\CodeSharp.Api.csproj" />
     <ProjectReference Include="..\CodeSharp.Tools\CodeSharp.Tools.csproj" />

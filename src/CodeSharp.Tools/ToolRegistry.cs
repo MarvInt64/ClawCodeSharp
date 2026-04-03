@@ -247,6 +247,39 @@ public class GlobalToolRegistry
             },
             PermissionMode.ReadOnly
         ),
+        new("find_symbol", "Find likely source-code symbol declarations across the workspace for languages such as C#, C/C++, JavaScript, TypeScript, Python, and HTML.",
+            new
+            {
+                type = "object",
+                properties = new
+                {
+                    symbol = new { type = "string" },
+                    path = new { type = "string" },
+                    kind = new { type = "string" },
+                    match_type = new { type = "string", @enum = new[] { "exact", "prefix", "contains" } },
+                    limit = new { type = "integer", minimum = 1 }
+                },
+                required = new[] { "symbol" },
+                additionalProperties = false
+            },
+            PermissionMode.ReadOnly
+        ),
+        new("find_references", "Find likely symbol usages across the workspace. Use this after locating a declaration to inspect impact before editing.",
+            new
+            {
+                type = "object",
+                properties = new
+                {
+                    symbol = new { type = "string" },
+                    path = new { type = "string" },
+                    include_declarations = new { type = "boolean" },
+                    limit = new { type = "integer", minimum = 1 }
+                },
+                required = new[] { "symbol" },
+                additionalProperties = false
+            },
+            PermissionMode.ReadOnly
+        ),
         new("WebFetch", "Fetch a URL, convert it into readable text, and answer a prompt about it.",
             new
             {

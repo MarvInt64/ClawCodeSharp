@@ -214,7 +214,11 @@ public class ArgumentParser
             model = ModelAliases.ResolveModelAlias(globalSettings.Model);
         }
 
-        if (!explicitProvider && globalSettings.GetProviderKind() is { } configuredProvider)
+        if (!explicitProvider && !string.IsNullOrWhiteSpace(globalSettings.Model))
+        {
+            provider = ProviderAccessWorkflow.ResolveProviderKind(model);
+        }
+        else if (!explicitProvider && globalSettings.GetProviderKind() is { } configuredProvider)
         {
             provider = configuredProvider;
         }

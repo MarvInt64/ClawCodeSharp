@@ -11,6 +11,9 @@ namespace CodeSharp.Tools;
 public class ToolExecutor : IToolExecutor
 {
     private const int DefaultReadFileLimit = 250;
+    private const int MaxShellOutputChars = 12_000;
+    private const int ShellOutputHeadChars = 9_000;
+    private const int ShellOutputTailChars = 2_000;
 
     private readonly GlobalToolRegistry _registry;
     private readonly string _workingDirectory;
@@ -47,6 +50,8 @@ public class ToolExecutor : IToolExecutor
             "edit_file" => await ExecuteEditFileAsync(input, cancellationToken),
             "glob_search" => ExecuteGlobSearch(input),
             "grep_search" => ExecuteGrepSearch(input),
+            "find_symbol" => ExecuteFindSymbol(input),
+            "find_references" => ExecuteFindReferences(input),
             "WebFetch" => await ExecuteWebFetchAsync(input, cancellationToken),
             "WebSearch" => await ExecuteWebSearchAsync(input, cancellationToken),
             "TodoWrite" => ExecuteTodoWrite(input),
@@ -121,12 +126,34 @@ public class ToolExecutor : IToolExecutor
             process.Kill();
             var partialOut = await stdoutTask;
             var partialErr = await stderrTask;
-            return JsonSerializer.Serialize(new { error = "Command timed out", stdout = partialOut, stderr = partialErr });
+            var limitedStdout = LimitShellOutput(partialOut);
+            var limitedStderr = LimitShellOutput(partialErr);
+            return JsonSerializer.Serialize(new
+            {
+                error = "Command timed out",
+                stdout = limitedStdout.Content,
+                stdoutTruncated = limitedStdout.Truncated,
+                stdoutOriginalLength = limitedStdout.OriginalLength,
+                stderr = limitedStderr.Content,
+                stderrTruncated = limitedStderr.Truncated,
+                stderrOriginalLength = limitedStderr.OriginalLength
+            });
         }
 
         var stdout = await stdoutTask;
         var stderr = await stderrTask;
-        return JsonSerializer.Serialize(new { stdout, stderr, exitCode = process.ExitCode });
+        var stdoutResult = LimitShellOutput(stdout);
+        var stderrResult = LimitShellOutput(stderr);
+        return JsonSerializer.Serialize(new
+        {
+            stdout = stdoutResult.Content,
+            stdoutTruncated = stdoutResult.Truncated,
+            stdoutOriginalLength = stdoutResult.OriginalLength,
+            stderr = stderrResult.Content,
+            stderrTruncated = stderrResult.Truncated,
+            stderrOriginalLength = stderrResult.OriginalLength,
+            exitCode = process.ExitCode
+        });
     }
     
     private async Task<string> ExecuteReadFileAsync(JsonElement input, CancellationToken cancellationToken)
@@ -389,6 +416,72 @@ public class ToolExecutor : IToolExecutor
             truncated = totalMatches > matches.Count
         });
     }
+
+    private string ExecuteFindSymbol(JsonElement input)
+    {
+        var query = input.GetProperty("symbol").GetString() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return JsonSerializer.Serialize(new { query, totalMatches = 0, matches = Array.Empty<object>(), truncated = false });
+        }
+
+        var basePath = input.TryGetProperty("path", out var pathEl)
+            ? pathEl.GetString() ?? _workingDirectory
+            : _workingDirectory;
+        var kind = input.TryGetProperty("kind", out var kindEl) ? kindEl.GetString() : null;
+        var matchType = input.TryGetProperty("match_type", out var matchTypeEl) ? matchTypeEl.GetString() : null;
+        var limit = input.TryGetProperty("limit", out var limitEl) ? limitEl.GetInt32() : 20;
+
+        var fullPath = Path.GetFullPath(basePath, _workingDirectory);
+        var files = EnumerateSourceFiles(fullPath).ToList();
+        var result = WorkspaceSymbolSearch.FindSymbols(files, ResolveSearchRoot(fullPath), query, kind, limit, matchType);
+        return JsonSerializer.Serialize(result);
+    }
+
+    private string ExecuteFindReferences(JsonElement input)
+    {
+        var symbol = input.GetProperty("symbol").GetString() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(symbol))
+        {
+            return JsonSerializer.Serialize(new { symbol, definitions = Array.Empty<object>(), totalReferences = 0, references = Array.Empty<object>(), truncated = false });
+        }
+
+        var basePath = input.TryGetProperty("path", out var pathEl)
+            ? pathEl.GetString() ?? _workingDirectory
+            : _workingDirectory;
+        var includeDeclarations = input.TryGetProperty("include_declarations", out var includeEl) && includeEl.GetBoolean();
+        var limit = input.TryGetProperty("limit", out var limitEl) ? limitEl.GetInt32() : 50;
+
+        var fullPath = Path.GetFullPath(basePath, _workingDirectory);
+        var files = EnumerateSourceFiles(fullPath).ToList();
+        var result = WorkspaceSymbolSearch.FindReferences(files, ResolveSearchRoot(fullPath), symbol, limit, includeDeclarations);
+        return JsonSerializer.Serialize(result);
+    }
+
+    private IEnumerable<string> EnumerateSourceFiles(string path)
+    {
+        if (File.Exists(path))
+        {
+            if (WorkspaceSymbolSearch.IsSupportedSourceFile(path) &&
+                !ShouldIgnoreSearchFile(path))
+            {
+                yield return path;
+            }
+
+            yield break;
+        }
+
+        foreach (var file in EnumerateSearchFiles(path))
+        {
+            if (WorkspaceSymbolSearch.IsSupportedSourceFile(file))
+            {
+                yield return file;
+            }
+        }
+    }
+
+    private static string ResolveSearchRoot(string path) =>
+        File.Exists(path) ? Path.GetDirectoryName(path) ?? Directory.GetCurrentDirectory() : path;
 
     private IEnumerable<string> EnumerateSearchFiles(string rootPath)
     {
@@ -704,8 +797,37 @@ public class ToolExecutor : IToolExecutor
         var stdout = await process.StandardOutput.ReadToEndAsync(cancellationToken);
         var stderr = await process.StandardError.ReadToEndAsync(cancellationToken);
         await process.WaitForExitAsync(cancellationToken);
-        
-        return JsonSerializer.Serialize(new { stdout, stderr, exitCode = process.ExitCode });
+
+        var stdoutResult = LimitShellOutput(stdout);
+        var stderrResult = LimitShellOutput(stderr);
+        return JsonSerializer.Serialize(new
+        {
+            stdout = stdoutResult.Content,
+            stdoutTruncated = stdoutResult.Truncated,
+            stdoutOriginalLength = stdoutResult.OriginalLength,
+            stderr = stderrResult.Content,
+            stderrTruncated = stderrResult.Truncated,
+            stderrOriginalLength = stderrResult.OriginalLength,
+            exitCode = process.ExitCode
+        });
+    }
+
+    private static TruncatedProcessOutput LimitShellOutput(string text)
+    {
+        if (string.IsNullOrEmpty(text) || text.Length <= MaxShellOutputChars)
+        {
+            return new TruncatedProcessOutput(text, false, text.Length);
+        }
+
+        var head = text[..Math.Min(ShellOutputHeadChars, text.Length)];
+        var tailLength = Math.Min(ShellOutputTailChars, Math.Max(0, text.Length - head.Length));
+        var tail = tailLength > 0 ? text[^tailLength..] : string.Empty;
+        var omitted = text.Length - head.Length - tail.Length;
+        var content = omitted > 0
+            ? $"{head}\n[truncated {omitted} chars]\n{tail}"
+            : head;
+
+        return new TruncatedProcessOutput(content, true, text.Length);
     }
 
     private static bool GlobMatches(string relativePath, string pattern)
@@ -980,6 +1102,7 @@ public class ToolExecutor : IToolExecutor
 internal record GrepMatch(string File, int Line, string Content, string[] ContextBefore, string[] ContextAfter);
 internal record TodoItem(string Content, string ActiveForm, string Status);
 internal sealed record DiffPreview(IReadOnlyList<string> Lines, bool Truncated);
+internal sealed record TruncatedProcessOutput(string Content, bool Truncated, int OriginalLength);
 
 internal sealed class GitIgnoreMatcher
 {

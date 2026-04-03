@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using CodeSharp.Api;
 using CodeSharp.Core;
 using CodeSharp.Tools;
@@ -31,7 +32,13 @@ public class StreamingApiClient : IApiClient
         CancellationToken cancellationToken = default
     )
     {
-        var inputMessages = request.Messages.Select(ConvertMessage).ToList();
+        var preparedMessages = SessionCompactor.CompactToFitContext(
+            request.Messages,
+            string.Empty,
+            _model,
+            EstimateRequestOverheadChars(request.SystemPrompt)
+        );
+        var inputMessages = preparedMessages.Select(ConvertMessage).ToList();
         
         var messageRequest = new MessageRequest(
             _model,
@@ -139,6 +146,20 @@ public class StreamingApiClient : IApiClient
         }
         
         return events;
+    }
+
+    private int EstimateRequestOverheadChars(IReadOnlyList<string> systemPrompt)
+    {
+        var total = string.Join("\n\n", systemPrompt).Length + 512;
+        foreach (var tool in _tools)
+        {
+            total += tool.Name.Length;
+            total += tool.Description?.Length ?? 0;
+            total += (tool.InputSchema is null ? 0 : JsonSerializer.Serialize(tool.InputSchema).Length);
+            total += 256;
+        }
+
+        return total;
     }
     
     private InputMessage ConvertMessage(ConversationMessage msg)

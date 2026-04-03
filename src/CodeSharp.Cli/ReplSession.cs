@@ -1,8 +1,10 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 using CodeSharp.Api;
 using CodeSharp.Commands;
 using CodeSharp.Core;
+using CodeSharp.Tools;
 
 namespace CodeSharp.Cli;
 
@@ -22,9 +24,11 @@ public class ReplSession
     private readonly string _sessionPath;
     private readonly GlobalSettingsStore _globalSettingsStore;
     private readonly StreamingApiClient _apiClient;
+    private readonly ToolExecutor _toolExecutor;
 
     public ReplSession(
         ConversationRuntime runtime,
+        ToolExecutor toolExecutor,
         StreamingApiClient apiClient,
         string model,
         string provider,
@@ -33,6 +37,7 @@ public class ReplSession
     )
     {
         _runtime = runtime;
+        _toolExecutor = toolExecutor;
         _apiClient = apiClient;
         _model = model;
         _provider = provider;
@@ -137,6 +142,14 @@ public class ReplSession
                 await HandleDiffAsync();
                 return new SlashCommandResult(false);
 
+            case SlashCommandKind.Symbols:
+                await HandleSymbolsAsync(command.Args);
+                return new SlashCommandResult(false);
+
+            case SlashCommandKind.References:
+                await HandleReferencesAsync(command.Args);
+                return new SlashCommandResult(false);
+
             case SlashCommandKind.Commit:
                 await HandleCommitAsync();
                 return new SlashCommandResult(false);
@@ -158,10 +171,17 @@ public class ReplSession
 
                 if (updatedSettings != previousSettings)
                 {
-                    newBusyLabel = ApplyGlobalSettingsToCurrentSession(updatedSettings);
-                    footer = string.IsNullOrWhiteSpace(footer)
-                        ? "Applied to the current REPL session."
-                        : $"{footer}\nApplied to the current REPL session.";
+                    try
+                    {
+                        newBusyLabel = ApplyGlobalSettingsToCurrentSession(updatedSettings);
+                        footer = string.IsNullOrWhiteSpace(footer)
+                            ? "Applied to the current REPL session."
+                            : $"{footer}\nApplied to the current REPL session.";
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        Console.WriteLine(ConsoleUi.ErrorBlock(ex.Message));
+                    }
                 }
 
                 Console.WriteLine(ConsoleUi.MessageBlock(result.Title, result.Body, footer));
@@ -202,9 +222,29 @@ public class ReplSession
     private string SwitchModel(string modelInput)
     {
         var resolvedModel = ProviderDetection.ResolveModelAlias(modelInput);
-        var providerKind = ProviderDetection.DetectProviderKind(resolvedModel);
+        var providerKind = ProviderAccessWorkflow.ResolveProviderKind(resolvedModel);
         var settings = _globalSettingsStore.Load();
-        var apiKey = settings.GetApiKey(providerKind);
+        string apiKey;
+        try
+        {
+            var resolution = ProviderAccessWorkflow.EnsureApiKeyAvailable(
+                settings,
+                providerKind,
+                resolvedModel,
+                StartupBanner().Replace("\r\n", "\n").Split('\n')
+            );
+            apiKey = resolution.ApiKey;
+            if (resolution.Prompted)
+            {
+                _globalSettingsStore.Save(settings.WithApiKey(providerKind, resolution.ApiKey));
+            }
+        }
+        catch (InvalidOperationException ex)
+        {
+            Console.WriteLine(ConsoleUi.ErrorBlock(ex.Message));
+            return $"Thinking with {_provider} · {_model}";
+        }
+
         var newClient = ProviderClient.FromProvider(providerKind, apiKey);
 
         _apiClient.SwitchModel(resolvedModel, newClient);
@@ -223,9 +263,19 @@ public class ReplSession
     private string ApplyGlobalSettingsToCurrentSession(GlobalSettings settings)
     {
         var effectiveModel = settings.Model ?? _model;
-        var effectiveProvider = settings.GetProviderKind() ?? ProviderDetection.DetectProviderKind(effectiveModel);
-        var apiKey = settings.GetApiKey(effectiveProvider);
-        var newClient = ProviderClient.FromProvider(effectiveProvider, apiKey);
+        var effectiveProvider = ProviderAccessWorkflow.ResolveProviderKind(effectiveModel, settings.GetProviderKind());
+        var resolution = ProviderAccessWorkflow.EnsureApiKeyAvailable(
+            settings,
+            effectiveProvider,
+            effectiveModel,
+            StartupBanner().Replace("\r\n", "\n").Split('\n')
+        );
+        if (resolution.Prompted)
+        {
+            _globalSettingsStore.Save(settings.WithApiKey(effectiveProvider, resolution.ApiKey));
+        }
+
+        var newClient = ProviderClient.FromProvider(effectiveProvider, resolution.ApiKey);
 
         _apiClient.SwitchModel(effectiveModel, newClient);
         _model = effectiveModel;
@@ -242,6 +292,133 @@ public class ReplSession
         ProviderKind.Nvidia => "nvidia",
         _ => provider.ToString().ToLowerInvariant()
     };
+
+    private async Task HandleSymbolsAsync(string? args)
+    {
+        var symbol = args?.Trim();
+        if (string.IsNullOrWhiteSpace(symbol))
+        {
+            Console.WriteLine(ConsoleUi.MessageBlock("symbols", "Usage: /symbols <name>"));
+            return;
+        }
+
+        var input = JsonSerializer.Serialize(new { symbol, match_type = "contains", limit = 20 });
+        var result = await _toolExecutor.ExecuteAsync("find_symbol", input);
+        Console.WriteLine(RenderSymbolSearchResult(result.Output, symbol));
+    }
+
+    private async Task HandleReferencesAsync(string? args)
+    {
+        var symbol = args?.Trim();
+        if (string.IsNullOrWhiteSpace(symbol))
+        {
+            Console.WriteLine(ConsoleUi.MessageBlock("refs", "Usage: /refs <name>"));
+            return;
+        }
+
+        var input = JsonSerializer.Serialize(new { symbol, include_declarations = true, limit = 40 });
+        var result = await _toolExecutor.ExecuteAsync("find_references", input);
+        Console.WriteLine(RenderReferenceSearchResult(result.Output, symbol));
+    }
+
+    private static string RenderSymbolSearchResult(string output, string symbol)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            var root = document.RootElement;
+            var totalMatches = root.GetProperty("totalMatches").GetInt32();
+            if (totalMatches == 0)
+            {
+                return ConsoleUi.MessageBlock("symbols", $"No symbol matches for `{symbol}`.");
+            }
+
+            var lines = new List<string>();
+            foreach (var item in root.GetProperty("matches").EnumerateArray())
+            {
+                var language = JsonString(item, "language") ?? "source";
+                var kind = JsonString(item, "kind") ?? "symbol";
+                var name = JsonString(item, "name") ?? symbol;
+                var file = JsonString(item, "file") ?? "file";
+                var line = JsonInt(item, "line");
+                var context = JsonString(item, "context");
+
+                lines.Add($"{language} {kind} {name} · {file}:{line}");
+                if (!string.IsNullOrWhiteSpace(context))
+                {
+                    lines.Add($"  {context}");
+                }
+            }
+
+            var footer = $"{totalMatches} match{(totalMatches == 1 ? string.Empty : "es")}";
+            if (root.TryGetProperty("truncated", out var truncated) && truncated.ValueKind == JsonValueKind.True)
+            {
+                footer += " · truncated";
+            }
+
+            return ConsoleUi.MessageBlock("symbols", lines, footer);
+        }
+        catch
+        {
+            return ConsoleUi.ErrorBlock(output);
+        }
+    }
+
+    private static string RenderReferenceSearchResult(string output, string symbol)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            var root = document.RootElement;
+            var totalReferences = root.GetProperty("totalReferences").GetInt32();
+            if (totalReferences == 0)
+            {
+                return ConsoleUi.MessageBlock("refs", $"No references found for `{symbol}`.");
+            }
+
+            var lines = new List<string>();
+            foreach (var item in root.GetProperty("references").EnumerateArray())
+            {
+                var file = JsonString(item, "file") ?? "file";
+                var line = JsonInt(item, "line");
+                var context = JsonString(item, "context");
+                var suffix = item.TryGetProperty("isDeclaration", out var isDeclaration) && isDeclaration.ValueKind == JsonValueKind.True
+                    ? " · declaration"
+                    : string.Empty;
+
+                lines.Add($"{file}:{line}{suffix}");
+                if (!string.IsNullOrWhiteSpace(context))
+                {
+                    lines.Add($"  {context}");
+                }
+            }
+
+            var definitionCount = root.TryGetProperty("definitions", out var definitions) && definitions.ValueKind == JsonValueKind.Array
+                ? definitions.GetArrayLength()
+                : 0;
+            var footer = $"{totalReferences} reference{(totalReferences == 1 ? string.Empty : "s")} · {definitionCount} definition{(definitionCount == 1 ? string.Empty : "s")}";
+            if (root.TryGetProperty("truncated", out var truncated) && truncated.ValueKind == JsonValueKind.True)
+            {
+                footer += " · truncated";
+            }
+
+            return ConsoleUi.MessageBlock("refs", lines, footer);
+        }
+        catch
+        {
+            return ConsoleUi.ErrorBlock(output);
+        }
+    }
+
+    private static string? JsonString(JsonElement element, string propertyName) =>
+        element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static int? JsonInt(JsonElement element, string propertyName) =>
+        element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.Number
+            ? value.GetInt32()
+            : null;
 
     // ── /compact ────────────────────────────────────────────────────────────────
 

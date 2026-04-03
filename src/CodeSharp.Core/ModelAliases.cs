@@ -16,4 +16,19 @@ public static class ModelAliases
     
     public static int MaxTokensForModel(string model) =>
         model.Contains("opus") ? 32_000 : 64_000;
+
+    public static int EstimatedContextWindowForModel(string model)
+    {
+        var normalized = model.ToLowerInvariant();
+        return normalized switch
+        {
+            _ when normalized.Contains("gpt-5") => 200_000,
+            _ when normalized.Contains("gpt-4.1") => 200_000,
+            _ when normalized.Contains("o3") => 200_000,
+            _ when normalized.Contains("claude") => 180_000,
+            _ when normalized.Contains("kimi") => 128_000,
+            _ when normalized.Contains("glm") => 128_000,
+            _ => 128_000
+        };
+    }
 }

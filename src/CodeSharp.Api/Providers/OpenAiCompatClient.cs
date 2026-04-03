@@ -51,7 +51,7 @@ public class OpenAiCompatClient : IProvider
     
     public async Task<MessageResponse> SendMessageAsync(MessageRequest request, CancellationToken cancellationToken = default)
     {
-        var openAiRequest = ConvertToOpenAiRequest(request);
+        var openAiRequest = BuildTransportRequest(request);
         var json = JsonSerializer.Serialize(openAiRequest);
 
         using var response = await SendWithRetryAsync(
@@ -71,7 +71,7 @@ public class OpenAiCompatClient : IProvider
     
     public async IAsyncEnumerable<StreamEvent> StreamMessageAsync(MessageRequest request, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var openAiRequest = ConvertToOpenAiRequest(request, stream: true);
+        var openAiRequest = BuildTransportRequest(request, stream: true);
 
         var json = JsonSerializer.Serialize(openAiRequest);
         using var response = await SendWithRetryAsync(
@@ -129,7 +129,7 @@ public class OpenAiCompatClient : IProvider
         }
     }
     
-    private object ConvertToOpenAiRequest(MessageRequest request, bool stream = false)
+    internal object BuildTransportRequest(MessageRequest request, bool stream = false)
     {
         var messages = new List<object>();
 
@@ -475,7 +475,54 @@ public class OpenAiCompatClient : IProvider
             return "api rate limit exceeded (429): please wait a moment and try again";
         }
 
+        if (TryExtractError(body, out var code, out var message))
+        {
+            if (string.Equals(code, "context_length_exceeded", StringComparison.OrdinalIgnoreCase))
+            {
+                return $"model context limit exceeded: {message}";
+            }
+
+            if (!string.IsNullOrWhiteSpace(message))
+            {
+                return $"API request failed with status {statusCode}: {message}";
+            }
+        }
+
         return $"API request failed with status {statusCode}: {body}";
+    }
+
+    private static bool TryExtractError(string body, out string? code, out string? message)
+    {
+        code = null;
+        message = null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+            if (!document.RootElement.TryGetProperty("error", out var error) ||
+                error.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            if (error.TryGetProperty("code", out var codeElement) &&
+                codeElement.ValueKind == JsonValueKind.String)
+            {
+                code = codeElement.GetString();
+            }
+
+            if (error.TryGetProperty("message", out var messageElement) &&
+                messageElement.ValueKind == JsonValueKind.String)
+            {
+                message = messageElement.GetString();
+            }
+
+            return code is not null || message is not null;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static string? NormalizeStopReason(string? finishReason)

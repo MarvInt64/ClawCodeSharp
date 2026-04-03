@@ -52,7 +52,8 @@ internal sealed class GlobalSettingsStore
 internal sealed record GlobalSettings(
     string? Model = null,
     string? Provider = null,
-    GlobalApiKeys? ApiKeys = null
+    GlobalApiKeys? ApiKeys = null,
+    string? AutoVerify = null
 )
 {
     public string? GetApiKey(ProviderKind provider) => provider switch
@@ -76,6 +77,9 @@ internal sealed record GlobalSettings(
             : null;
     }
 
+    public AutoVerifyMode GetAutoVerifyMode() =>
+        AutoVerifyModeExtensions.TryParse(AutoVerify, out var mode) ? mode : AutoVerifyMode.DangerOnly;
+
     public GlobalSettings WithModel(string? model) =>
         this with { Model = string.IsNullOrWhiteSpace(model) ? null : ModelAliases.ResolveModelAlias(model.Trim()) };
 
@@ -95,6 +99,9 @@ internal sealed record GlobalSettings(
 
         return this with { ApiKeys = keys };
     }
+
+    public GlobalSettings WithAutoVerify(AutoVerifyMode? mode) =>
+        this with { AutoVerify = mode?.AsString() };
 }
 
 internal sealed record GlobalApiKeys(
@@ -130,7 +137,7 @@ internal static class ConfigCommandProcessor
                 store.SettingsPath,
                 "Global settings are stored in ~/.codesharp/settings.json."
             ),
-            "set" => HandleSet(tokens.Skip(1).ToArray(), settings, store),
+            "set" => HandleSet(tokens.Skip(1).ToArray(), settings, store, headerLines),
             "unset" => HandleUnset(tokens.Skip(1).ToArray(), settings, store),
             _ => RenderHelp(store.SettingsPath)
         };
@@ -149,8 +156,8 @@ internal static class ConfigCommandProcessor
             var choice = RunMenu(
                 "config",
                 [
-                    ("Provider", settings.Provider ?? "(not set)"),
                     ("Model", settings.Model ?? "(not set)"),
+                    ("Provider access", ProviderAccessWorkflow.DescribeProviderAccess(settings)),
                     ("API keys", $"{CountConfiguredKeys(settings)}/4 configured"),
                     ("Clear values", "Remove defaults or stored keys"),
                     ("Show summary", "Inspect the current global config"),
@@ -164,10 +171,10 @@ internal static class ConfigCommandProcessor
             switch (choice)
             {
                 case 0:
-                    SaveProviderFromMenu(store, settings, headerLines);
+                    SaveModelFromMenu(store, settings, headerLines);
                     break;
                 case 1:
-                    SaveModelFromMenu(store, settings, headerLines);
+                    SaveProviderFromMenu(store, settings, headerLines);
                     break;
                 case 2:
                     ManageApiKeysFromMenu(store, settings, headerLines);
@@ -193,7 +200,8 @@ internal static class ConfigCommandProcessor
     private static ConfigCommandResult HandleSet(
         IReadOnlyList<string> tokens,
         GlobalSettings settings,
-        GlobalSettingsStore store
+        GlobalSettingsStore store,
+        IReadOnlyList<string>? headerLines
     )
     {
         if (tokens.Count < 2)
@@ -206,11 +214,24 @@ internal static class ConfigCommandProcessor
             case "model":
             {
                 var model = string.Join(' ', tokens.Skip(1));
-                var updated = settings.WithModel(model);
+                var updated = ProviderAccessWorkflow.SynchronizeModelSelection(settings, model);
+                if (!string.IsNullOrWhiteSpace(updated.Model))
+                {
+                    var resolution = ProviderAccessWorkflow.EnsureApiKeyAvailable(
+                        updated,
+                        ProviderDetection.DetectProviderKind(updated.Model),
+                        updated.Model,
+                        headerLines
+                    );
+                    if (resolution.Prompted)
+                    {
+                        updated = updated.WithApiKey(ProviderDetection.DetectProviderKind(updated.Model), resolution.ApiKey);
+                    }
+                }
                 store.Save(updated);
                 return new ConfigCommandResult(
                     "config",
-                    $"Saved default model:\n{updated.Model}",
+                    $"Saved default model:\n{updated.Model}\nProvider: {updated.Provider}",
                     $"Stored in {store.SettingsPath}"
                 );
             }
@@ -223,6 +244,12 @@ internal static class ConfigCommandProcessor
                 }
 
                 var updated = settings.WithProvider(providerToken);
+                ProviderParsing.TryParseProvider(providerToken, out var provider);
+                var resolution = ProviderAccessWorkflow.EnsureApiKeyAvailable(updated, provider, updated.Model, headerLines);
+                if (resolution.Prompted)
+                {
+                    updated = updated.WithApiKey(provider, resolution.ApiKey);
+                }
                 store.Save(updated);
                 return new ConfigCommandResult(
                     "config",
@@ -254,6 +281,28 @@ internal static class ConfigCommandProcessor
                 return new ConfigCommandResult(
                     "config",
                     $"Saved API key for {ProviderParsing.NormalizeProvider(provider)}:\n{MaskSecret(updated.GetApiKey(provider))}",
+                    $"Stored in {store.SettingsPath}"
+                );
+            }
+            case "auto-verify":
+            case "autoverify":
+            {
+                var modeToken = tokens[1];
+                AutoVerifyMode mode;
+                try
+                {
+                    mode = AutoVerifyModeExtensions.FromString(modeToken);
+                }
+                catch (ArgumentException)
+                {
+                    return new ConfigCommandResult("config", $"Unknown auto-verify mode: {modeToken}");
+                }
+
+                var updated = settings.WithAutoVerify(mode);
+                store.Save(updated);
+                return new ConfigCommandResult(
+                    "config",
+                    $"Saved auto-verify mode:\n{updated.GetAutoVerifyMode().AsString()}",
                     $"Stored in {store.SettingsPath}"
                 );
             }
@@ -304,6 +353,17 @@ internal static class ConfigCommandProcessor
                     $"Stored in {store.SettingsPath}"
                 );
             }
+            case "auto-verify":
+            case "autoverify":
+            {
+                var updated = settings.WithAutoVerify(null);
+                store.Save(updated);
+                return new ConfigCommandResult(
+                    "config",
+                    "Removed stored auto-verify mode.",
+                    $"Stored in {store.SettingsPath}"
+                );
+            }
             default:
                 return RenderHelp(store.SettingsPath);
         }
@@ -316,6 +376,8 @@ internal static class ConfigCommandProcessor
             .AppendLine($"  Path             {settingsPath}")
             .AppendLine($"  Model            {settings.Model ?? "(not set)"}")
             .AppendLine($"  Provider         {settings.Provider ?? "(not set)"}")
+            .AppendLine($"  Access           {ProviderAccessWorkflow.DescribeProviderAccess(settings)}")
+            .AppendLine($"  Auto verify      {settings.GetAutoVerifyMode().AsString()}")
             .AppendLine($"  Anthropic key    {MaskSecret(settings.ApiKeys?.Anthropic)}")
             .AppendLine($"  OpenAI key       {MaskSecret(settings.ApiKeys?.OpenAi)}")
             .AppendLine($"  xAI key          {MaskSecret(settings.ApiKeys?.Xai)}")
@@ -326,9 +388,11 @@ internal static class ConfigCommandProcessor
             .AppendLine("  codesharp config set model <name>")
             .AppendLine("  codesharp config set provider <anthropic|openai|xai|nvidia>")
             .AppendLine("  codesharp config set api-key <provider> [value]")
+            .AppendLine("  codesharp config set auto-verify <off|danger-only|on>")
             .AppendLine("  codesharp config unset model")
             .AppendLine("  codesharp config unset provider")
-            .AppendLine("  codesharp config unset api-key <provider>");
+            .AppendLine("  codesharp config unset api-key <provider>")
+            .AppendLine("  codesharp config unset auto-verify");
 
         return new ConfigCommandResult("config", body.ToString().TrimEnd());
     }
@@ -345,9 +409,11 @@ Usage
   codesharp config set model <name>
   codesharp config set provider <anthropic|openai|xai|nvidia>
   codesharp config set api-key <provider> [value]
+  codesharp config set auto-verify <off|danger-only|on>
   codesharp config unset model
   codesharp config unset provider
-  codesharp config unset api-key <provider>"
+  codesharp config unset api-key <provider>
+  codesharp config unset auto-verify"
     );
 
     private static List<string> Tokenize(string? args) =>
@@ -375,7 +441,22 @@ Usage
         ClearAndRenderHeader(headerLines);
         Console.Write("Default model (empty clears): ");
         var model = Console.ReadLine();
-        store.Save(settings.WithModel(model));
+        var updated = ProviderAccessWorkflow.SynchronizeModelSelection(settings, model);
+        if (!string.IsNullOrWhiteSpace(updated.Model))
+        {
+            var provider = ProviderDetection.DetectProviderKind(updated.Model);
+            var resolution = ProviderAccessWorkflow.EnsureApiKeyAvailable(
+                updated,
+                provider,
+                updated.Model,
+                headerLines
+            );
+            if (resolution.Prompted)
+            {
+                updated = updated.WithApiKey(provider, resolution.ApiKey);
+            }
+        }
+        store.Save(updated);
     }
 
     private static void SaveModelFromMenu(GlobalSettingsStore store, GlobalSettings settings, IReadOnlyList<string>? headerLines)
@@ -470,7 +551,16 @@ Usage
             return;
         }
 
-        store.Save(settings.WithProvider(normalized));
+        var updated = settings.WithProvider(normalized);
+        if (ProviderParsing.TryParseProvider(normalized, out var provider))
+        {
+            var resolution = ProviderAccessWorkflow.EnsureApiKeyAvailable(updated, provider, updated.Model);
+            if (resolution.Prompted)
+            {
+                updated = updated.WithApiKey(provider, resolution.ApiKey);
+            }
+        }
+        store.Save(updated);
     }
 
     private static void SaveProviderFromMenu(GlobalSettingsStore store, GlobalSettings settings, IReadOnlyList<string>? headerLines)
@@ -492,16 +582,16 @@ Usage
         switch (choice)
         {
             case 0:
-                store.Save(settings.WithProvider("anthropic"));
+                SaveProviderSelection(store, settings, ProviderKind.CodeSharpApi, headerLines);
                 break;
             case 1:
-                store.Save(settings.WithProvider("openai"));
+                SaveProviderSelection(store, settings, ProviderKind.OpenAi, headerLines);
                 break;
             case 2:
-                store.Save(settings.WithProvider("xai"));
+                SaveProviderSelection(store, settings, ProviderKind.Xai, headerLines);
                 break;
             case 3:
-                store.Save(settings.WithProvider("nvidia"));
+                SaveProviderSelection(store, settings, ProviderKind.Nvidia, headerLines);
                 break;
             case 4:
                 store.Save(settings.WithProvider(null));
@@ -515,6 +605,17 @@ Usage
         var providerName = ProviderParsing.NormalizeProvider(provider);
         var apiKey = ReadSecret($"API key for {providerName} (empty clears): ");
         store.Save(settings.WithApiKey(provider, apiKey));
+    }
+
+    private static void SaveProviderSelection(GlobalSettingsStore store, GlobalSettings settings, ProviderKind provider, IReadOnlyList<string>? headerLines)
+    {
+        var updated = settings.WithProvider(ProviderParsing.NormalizeProvider(provider));
+        var resolution = ProviderAccessWorkflow.EnsureApiKeyAvailable(updated, provider, updated.Model, headerLines);
+        if (resolution.Prompted)
+        {
+            updated = updated.WithApiKey(provider, resolution.ApiKey);
+        }
+        store.Save(updated);
     }
 
     private static void ManageApiKeysFromMenu(GlobalSettingsStore store, GlobalSettings settings, IReadOnlyList<string>? headerLines)

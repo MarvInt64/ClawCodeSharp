@@ -129,8 +129,8 @@ public class HttpServer
     
     private async Task CreateSession(HttpListenerResponse response)
     {
-        var session = _sessionStore.CreateSession();
-        await WriteJson(response, new { id = session.GetHashCode().ToString("x"), created = true });
+        var (id, _) = _sessionStore.CreateSession();
+        await WriteJson(response, new { id, created = true });
     }
     
     private async Task GetSession(HttpListenerResponse response, string id)

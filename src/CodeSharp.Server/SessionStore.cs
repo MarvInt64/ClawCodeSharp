@@ -1,5 +1,5 @@
 using System.Runtime.CompilerServices;
-using System.Text.Json;
+using System.Threading.Channels;
 using CodeSharp.Core;
 
 namespace CodeSharp.Server;
@@ -19,8 +19,10 @@ public record SessionEvent
 
 public class SessionStore
 {
+    private readonly object _gate = new();
     private readonly Dictionary<string, Session> _sessions = new();
     private readonly Dictionary<string, List<SessionEvent>> _events = new();
+    private readonly Dictionary<string, List<Channel<SessionEvent>>> _subscribers = new();
     private readonly string _sessionsDir;
     
     public SessionStore(string? sessionsDir = null)
@@ -29,49 +31,90 @@ public class SessionStore
         Directory.CreateDirectory(_sessionsDir);
     }
     
-    public Session CreateSession()
+    public (string Id, Session Session) CreateSession()
     {
         var id = Guid.NewGuid().ToString("N")[..8];
         var session = Session.New();
-        _sessions[id] = session;
-        _events[id] = new List<SessionEvent> { new SessionEvent.Snapshot(session) };
-        return session;
+        lock (_gate)
+        {
+            _sessions[id] = session;
+            _events[id] = new List<SessionEvent> { new SessionEvent.Snapshot(session.Clone()) };
+            _subscribers[id] = [];
+        }
+
+        return (id, session);
     }
     
     public Session? GetSession(string id)
     {
-        return _sessions.TryGetValue(id, out var session) ? session : null;
+        lock (_gate)
+        {
+            return _sessions.TryGetValue(id, out var session) ? session : null;
+        }
     }
     
     public IReadOnlyList<SessionInfo> ListSessions()
     {
-        return _sessions.Select(kvp => new SessionInfo(
-            kvp.Key,
-            Path.Combine(_sessionsDir, $"{kvp.Key}.json"),
-            kvp.Value.Messages.Count,
-            DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-        )).ToList();
+        lock (_gate)
+        {
+            return _sessions.Select(kvp => new SessionInfo(
+                kvp.Key,
+                Path.Combine(_sessionsDir, $"{kvp.Key}.json"),
+                kvp.Value.Messages.Count,
+                DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            )).ToList();
+        }
     }
     
     public void AddMessage(string sessionId, ConversationMessage message)
     {
-        if (_sessions.TryGetValue(sessionId, out var session))
+        List<Channel<SessionEvent>> subscribers;
+        SessionEvent sessionEvent;
+
+        lock (_gate)
         {
+            if (!_sessions.TryGetValue(sessionId, out var session))
+            {
+                return;
+            }
+
             session.AddMessage(message);
+            sessionEvent = new SessionEvent.Message(message);
+
             if (_events.TryGetValue(sessionId, out var events))
             {
-                events.Add(new SessionEvent.Message(message));
+                events.Add(sessionEvent);
             }
+
+            subscribers = _subscribers.TryGetValue(sessionId, out var channels)
+                ? channels.ToList()
+                : [];
+        }
+
+        foreach (var subscriber in subscribers)
+        {
+            subscriber.Writer.TryWrite(sessionEvent);
         }
     }
     
     public void SaveSession(string id)
     {
-        if (_sessions.TryGetValue(id, out var session))
+        string? json = null;
+        lock (_gate)
         {
-            var path = Path.Combine(_sessionsDir, $"{id}.json");
-            File.WriteAllText(path, session.ToJson());
+            if (_sessions.TryGetValue(id, out var session))
+            {
+                json = session.ToJson();
+            }
         }
+
+        if (json is null)
+        {
+            return;
+        }
+
+        var path = Path.Combine(_sessionsDir, $"{id}.json");
+        File.WriteAllText(path, json);
     }
     
     public IAsyncEnumerable<SessionEvent> GetEventStream(string sessionId, CancellationToken cancellationToken = default)
@@ -84,19 +127,68 @@ public class SessionStore
         [EnumeratorCancellation] CancellationToken cancellationToken
     )
     {
-        if (_events.TryGetValue(sessionId, out var events))
+        List<SessionEvent> replay;
+        var channel = Channel.CreateUnbounded<SessionEvent>();
+        var sessionExists = true;
+
+        lock (_gate)
         {
-            foreach (var ev in events)
+            if (!_events.TryGetValue(sessionId, out var events))
             {
-                if (cancellationToken.IsCancellationRequested)
-                    yield break;
-                yield return ev;
+                replay = [];
+                sessionExists = false;
+            }
+            else
+            {
+                replay = events.ToList();
+
+                if (!_subscribers.TryGetValue(sessionId, out var subscribers))
+                {
+                    subscribers = [];
+                    _subscribers[sessionId] = subscribers;
+                }
+
+                subscribers.Add(channel);
             }
         }
-        
-        while (!cancellationToken.IsCancellationRequested)
+
+        if (!sessionExists)
         {
-            await Task.Delay(1000, cancellationToken);
+            channel.Writer.TryComplete();
+            yield break;
+        }
+
+        try
+        {
+            foreach (var ev in replay)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return ev;
+            }
+
+            while (await channel.Reader.WaitToReadAsync(cancellationToken))
+            {
+                while (channel.Reader.TryRead(out var ev))
+                {
+                    yield return ev;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            yield break;
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                if (_subscribers.TryGetValue(sessionId, out var subscribers))
+                {
+                    subscribers.Remove(channel);
+                }
+            }
+
+            channel.Writer.TryComplete();
         }
     }
 }

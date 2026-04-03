@@ -1,4 +1,5 @@
 using CodeSharp.Api;
+using CodeSharp.Api.Providers;
 using CodeSharp.Commands;
 using CodeSharp.Core;
 using CodeSharp.Plugins;
@@ -579,7 +580,7 @@ Add any additional context about the project.
         var cwd = Directory.GetCurrentDirectory();
         var sessionPath = Path.Combine(cwd, ".codesharp", "sessions", $"session-{DateTime.UtcNow:yyyyMMdd-HHmmss}.json");
         Directory.CreateDirectory(Path.GetDirectoryName(sessionPath)!);
-        var provider = options.Provider ?? ProviderClient.DetectProviderKind(options.Model);
+        var provider = ProviderAccessWorkflow.ResolveProviderKind(options.Model, options.Provider);
         
         var (runtime, _, _, _) = BuildRuntime(options, sessionPath);
 
@@ -590,7 +591,7 @@ Add any additional context about the project.
             using var spinner = ConsoleUi.StartSpinner($"Thinking with {FormatProvider(provider)} · {options.Model}");
             var activity = new TurnActivityState();
 
-            var task = ExecuteTurnAsync(runtime, options.Prompt, activity, null, cts.Token);
+            var task = ExecuteTurnAsync(runtime, options.Prompt, options.Model, activity, null, cts.Token);
             while (!task.IsCompleted)
             {
                 if (interrupts.ConsumeRequested() && !cts.IsCancellationRequested)
@@ -644,11 +645,12 @@ Add any additional context about the project.
         var sessionPath = Path.Combine(cwd, ".codesharp", "sessions", $"session-{DateTime.UtcNow:yyyyMMdd-HHmmss}.json");
         Directory.CreateDirectory(Path.GetDirectoryName(sessionPath)!);
         
-        var (runtime, _, _, apiClient) = BuildRuntime(options, sessionPath);
-        var provider = options.Provider ?? ProviderClient.DetectProviderKind(options.Model);
+        var (runtime, _, toolExecutor, apiClient) = BuildRuntime(options, sessionPath);
+        var provider = ProviderAccessWorkflow.ResolveProviderKind(options.Model, options.Provider);
 
         var repl = new ReplSession(
             runtime,
+            toolExecutor,
             apiClient,
             options.Model,
             FormatProvider(provider),
@@ -939,8 +941,11 @@ Add any additional context about the project.
             "read_file" => $"reading {DisplayPath(JsonString(payload, "path")) ?? "file"}",
             "write_file" => $"writing {DisplayPath(JsonString(payload, "path")) ?? "file"}",
             "edit_file" => $"editing {DisplayPath(JsonString(payload, "path")) ?? "file"}",
+            "auto_verify" => DescribeAutoVerifyStart(payload),
             "glob_search" => DescribeGlobSearchStart(payload),
             "grep_search" => DescribeGrepSearchStart(payload),
+            "find_symbol" => $"finding symbol {Quote(JsonString(payload, "symbol"))}",
+            "find_references" => $"finding references to {Quote(JsonString(payload, "symbol"))}",
             "bash" => DescribeShellCommandStart(JsonString(payload, "command")),
             "PowerShell" => DescribeShellCommandStart(JsonString(payload, "command")),
             "WebFetch" => $"fetching {JsonString(payload, "url") ?? "url"}",
@@ -970,6 +975,9 @@ Add any additional context about the project.
             "read_file" => DescribeReadFileFinish(payload, fallbackDescription),
             "write_file" => isError ? $"failed writing {path}" : $"wrote {path}",
             "edit_file" => isError ? $"failed editing {path}" : $"edited {path}",
+            "auto_verify" => DescribeAutoVerifyFinish(payload, fallbackDescription, isError),
+            "find_symbol" => DescribeSearchSummaryFinish(payload, fallbackDescription, "totalMatches"),
+            "find_references" => DescribeSearchSummaryFinish(payload, fallbackDescription, "totalReferences"),
             "bash" => DescribeShellCommandFinish(payload, fallbackDescription, isError),
             "PowerShell" => DescribeShellCommandFinish(payload, fallbackDescription, isError),
             "TodoWrite" => isError ? "failed updating plan" : fallbackDescription,
@@ -979,13 +987,6 @@ Add any additional context about the project.
 
     internal static IReadOnlyList<string>? ExtractToolPreviewLines(string toolName, string output, bool isError)
     {
-        if (isError)
-        {
-            return string.IsNullOrWhiteSpace(output)
-                ? null
-                : WrapToolDetailText(output);
-        }
-
         JsonElement? payload = null;
         try
         {
@@ -998,9 +999,27 @@ Add any additional context about the project.
                 : WrapToolDetailText(output);
         }
 
+        if (toolName == "auto_verify")
+        {
+            return ExtractAutoVerifyPreviewLines(payload) ??
+                   (string.IsNullOrWhiteSpace(output) ? null : WrapToolDetailText(output));
+        }
+
+        if (isError)
+        {
+            return string.IsNullOrWhiteSpace(output)
+                ? null
+                : WrapToolDetailText(output);
+        }
+
         if (toolName == "read_file")
         {
             return ExtractReadFilePreviewLines(payload);
+        }
+
+        if (toolName is "find_symbol" or "find_references")
+        {
+            return ExtractSearchPreviewLines(payload);
         }
 
         if (toolName is "bash" or "PowerShell")
@@ -1091,6 +1110,121 @@ Add any additional context about the project.
         return exitCode is { } successCode && successCode != 0
             ? $"{fallbackDescription} finished (exit {successCode})"
             : fallbackDescription;
+    }
+
+    private static string DescribeAutoVerifyStart(JsonElement? payload)
+    {
+        var strategy = JsonString(payload, "strategy");
+        var command = JsonString(payload, "command");
+        if (!string.IsNullOrWhiteSpace(strategy) && !string.IsNullOrWhiteSpace(command))
+        {
+            return $"verifying changes with {strategy} ({command})";
+        }
+
+        if (!string.IsNullOrWhiteSpace(command))
+        {
+            return $"verifying changes with {command}";
+        }
+
+        return "verifying changes";
+    }
+
+    private static string DescribeAutoVerifyFinish(JsonElement? payload, string fallbackDescription, bool isError)
+    {
+        var strategy = JsonString(payload, "strategy");
+        var status = JsonString(payload, "status");
+        var exitCode = JsonInt(payload, "exitCode");
+        var label = string.IsNullOrWhiteSpace(strategy) ? fallbackDescription : $"verified changes with {strategy}";
+
+        if (string.Equals(status, "skipped", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"{label} skipped";
+        }
+
+        if (isError)
+        {
+            return exitCode is { } code
+                ? $"{label} failed (exit {code})"
+                : $"{label} failed";
+        }
+
+        return $"{label} passed";
+    }
+
+    private static string DescribeSearchSummaryFinish(JsonElement? payload, string fallbackDescription, string countProperty)
+    {
+        var count = JsonInt(payload, countProperty);
+        return count is null ? fallbackDescription : $"{fallbackDescription} ({count:N0})";
+    }
+
+    private static IReadOnlyList<string>? ExtractSearchPreviewLines(JsonElement? payload)
+    {
+        if (payload is not { ValueKind: JsonValueKind.Object } json)
+        {
+            return null;
+        }
+
+        if (json.TryGetProperty("matches", out var matches) && matches.ValueKind == JsonValueKind.Array)
+        {
+            return matches.EnumerateArray()
+                .Take(8)
+                .Select(FormatSearchPreviewItem)
+                .Where(static line => !string.IsNullOrWhiteSpace(line))
+                .ToList();
+        }
+
+        if (json.TryGetProperty("references", out var references) && references.ValueKind == JsonValueKind.Array)
+        {
+            return references.EnumerateArray()
+                .Take(8)
+                .Select(FormatSearchPreviewItem)
+                .Where(static line => !string.IsNullOrWhiteSpace(line))
+                .ToList();
+        }
+
+        return null;
+    }
+
+    private static string FormatSearchPreviewItem(JsonElement item)
+    {
+        if (item.ValueKind != JsonValueKind.Object)
+        {
+            return string.Empty;
+        }
+
+        var file = JsonString(item, "file") ?? "file";
+        var line = JsonInt(item, "line");
+        var kind = JsonString(item, "kind");
+        var name = JsonString(item, "name");
+        var language = JsonString(item, "language");
+        var context = JsonString(item, "context");
+
+        var location = line is null ? DisplayPath(file) : $"{DisplayPath(file)}:{line}";
+        var prefix = !string.IsNullOrWhiteSpace(kind) && !string.IsNullOrWhiteSpace(name)
+            ? $"{(string.IsNullOrWhiteSpace(language) ? string.Empty : $"{language} ")}{kind} {name} · "
+            : string.Empty;
+
+        return $"{prefix}{location} · {Truncate(context ?? string.Empty, 96)}";
+    }
+
+    private static IReadOnlyList<string>? ExtractAutoVerifyPreviewLines(JsonElement? payload)
+    {
+        if (payload is not { ValueKind: JsonValueKind.Object } json)
+        {
+            return null;
+        }
+
+        if (json.TryGetProperty("preview", out var preview) && preview.ValueKind == JsonValueKind.Array)
+        {
+            return preview.EnumerateArray()
+                .Take(8)
+                .Where(static item => item.ValueKind == JsonValueKind.String)
+                .Select(static item => item.GetString() ?? string.Empty)
+                .Where(static line => !string.IsNullOrWhiteSpace(line))
+                .ToList();
+        }
+
+        return null;
     }
 
     private static IReadOnlyList<string>? ExtractShellPreviewLines(JsonElement? payload)
@@ -1479,7 +1613,7 @@ Add any additional context about the project.
         var cts = new CancellationTokenSource();
         var activity = new TurnActivityState();
         console.CommitToHistory(ConsoleUi.UserTurn(trimmed));
-        var task = ExecuteTurnAsync(runtime, trimmed, activity, prompter, cts.Token);
+        var task = ExecuteTurnAsync(runtime, trimmed, repl.Model, activity, prompter, cts.Token);
         setActiveTurn(new ActiveTurn(task, cts, activity));
         console.EnterBusy(busyLabel, queuedInputs, activity.Snapshot());
         return false;
@@ -1488,12 +1622,18 @@ Add any additional context about the project.
     private static async Task<TurnExecutionResult> ExecuteTurnAsync(
         ConversationRuntime runtime,
         string input,
+        string model,
         TurnActivityState activity,
         IPermissionPrompter? prompter,
         CancellationToken cancellationToken
     )
     {
         var checkpoint = runtime.CaptureCheckpoint();
+
+        if (TryPrecompactSession(runtime.Session, input, model, activity))
+        {
+            checkpoint = runtime.CaptureCheckpoint();
+        }
 
         try
         {
@@ -1519,6 +1659,101 @@ Add any additional context about the project.
         {
             return new TurnExecutionResult(null, ex.Message, false);
         }
+        catch (ApiError ex) when (IsContextLimitError(ex))
+        {
+            runtime.RestoreCheckpoint(checkpoint);
+
+            var compactedMessages = SessionCompactor.CompactToFitContext(
+                runtime.Session.Messages,
+                input,
+                model,
+                24_000
+            );
+            if (compactedMessages.SequenceEqual(runtime.Session.Messages))
+            {
+                return new TurnExecutionResult(null, BuildContextLimitError(ex), false);
+            }
+
+            ReplaceSession(runtime.Session, compactedMessages);
+            activity.Record(new RuntimeActivity.AssistantPlan(
+                "Session exceeded the model context window; retrying with compacted history."
+            ));
+
+            try
+            {
+                var summary = await runtime.RunTurnAsync(
+                    input,
+                    prompter: prompter,
+                    activitySink: activity.Record,
+                    cancellationToken: cancellationToken
+                );
+                return new TurnExecutionResult(summary, null, false);
+            }
+            catch (ApiError retryEx) when (IsContextLimitError(retryEx))
+            {
+                runtime.RestoreCheckpoint(checkpoint);
+                return new TurnExecutionResult(null, BuildContextLimitError(retryEx), false);
+            }
+            catch (Exception retryError)
+            {
+                runtime.RestoreCheckpoint(checkpoint);
+                return new TurnExecutionResult(null, retryError.Message, false);
+            }
+        }
+        catch (ApiError ex)
+        {
+            runtime.RestoreCheckpoint(checkpoint);
+            return new TurnExecutionResult(null, ex.Message, false);
+        }
+        catch (Exception ex)
+        {
+            runtime.RestoreCheckpoint(checkpoint);
+            return new TurnExecutionResult(null, ex.Message, false);
+        }
+    }
+
+    private static bool IsContextLimitError(ApiError error) =>
+        error.Message.Contains("context_length_exceeded", StringComparison.OrdinalIgnoreCase) ||
+        error.Message.Contains("context limit exceeded", StringComparison.OrdinalIgnoreCase) ||
+        error.Message.Contains("maximum context length", StringComparison.OrdinalIgnoreCase);
+
+    private static string BuildContextLimitError(ApiError error) =>
+        $"{error.Message}\nUse /compact, /clear, or a narrower prompt if the session is still too large.";
+
+    private static void ReplaceSession(Session session, IReadOnlyList<ConversationMessage> messages)
+    {
+        session.Clear();
+        foreach (var message in messages)
+        {
+            session.AddMessage(message);
+        }
+    }
+
+    private static bool TryPrecompactSession(
+        Session session,
+        string input,
+        string model,
+        TurnActivityState activity
+    )
+    {
+        const int systemPromptReserveChars = 24_000;
+        var currentMessages = session.Messages;
+        var compactedMessages = SessionCompactor.CompactToFitContext(
+            currentMessages,
+            input,
+            model,
+            systemPromptReserveChars
+        );
+        if (compactedMessages.SequenceEqual(currentMessages))
+        {
+            return false;
+        }
+
+        ReplaceSession(session, compactedMessages);
+        activity.Record(new RuntimeActivity.AssistantPlan(
+            "Session grew large enough to risk the model context limit; compacting history before sending the next request."
+        ));
+        return true;
     }
 
     private static Task<bool> ConfirmExitAsync(
@@ -1581,7 +1816,8 @@ Add any additional context about the project.
     private static (ConversationRuntime, GlobalToolRegistry, ToolExecutor, StreamingApiClient) BuildRuntime(CliOptions options, string sessionPath)
     {
         var cwd = Directory.GetCurrentDirectory();
-        var globalSettings = new GlobalSettingsStore().Load();
+        var settingsStore = new GlobalSettingsStore();
+        var globalSettings = settingsStore.Load();
         
         var session = Session.New();
         
@@ -1603,8 +1839,15 @@ Add any additional context about the project.
         var toolPermissions = permissionSpecs.ToDictionary(p => p.Name, p => p.Mode);
         var permissionPolicy = new PermissionPolicy(options.PermissionMode, toolPermissions);
         
-        var provider = options.Provider ?? globalSettings.GetProviderKind() ?? ProviderClient.DetectProviderKind(options.Model);
-        var providerClient = ProviderClient.FromProvider(provider, globalSettings.GetApiKey(provider));
+        var provider = ProviderAccessWorkflow.ResolveProviderKind(options.Model, options.Provider);
+        var resolution = ProviderAccessWorkflow.EnsureApiKeyAvailable(globalSettings, provider, options.Model);
+        if (resolution.Prompted)
+        {
+            globalSettings = globalSettings.WithApiKey(provider, resolution.ApiKey);
+            settingsStore.Save(globalSettings);
+        }
+
+        var providerClient = ProviderClient.FromProvider(provider, resolution.ApiKey);
 
         var tools = registry.GetDefinitions(normalizedAllowedTools)
             .Where(t => IsModelVisibleTool(t.Name))
@@ -1626,7 +1869,9 @@ Add any additional context about the project.
             apiClient,
             toolExecutor,
             permissionPolicy,
-            systemPrompt
+            systemPrompt,
+            options.PermissionMode,
+            globalSettings.GetAutoVerifyMode()
         );
         
         return (runtime, registry, toolExecutor, apiClient);
@@ -1671,6 +1916,8 @@ Permission Mode: {permissionMode.AsString()}",
 Respect the tool surface exactly. Do not invent unavailable tools. Prefer read-only tools for analysis before using mutating tools. For write operations, make focused edits and avoid unrelated changes.",
             @"Tool usage guidance
 - Before using tools, say in one concise sentence what you are about to inspect, search, or change.
+- Use `find_symbol` when you know a likely identifier name and want declaration candidates across supported languages before falling back to broader regex search.
+- Use `find_references` after locating a declaration to inspect likely impact before editing across the workspace.
 - For repository exploration, start with grep_search or glob_search before calling read_file on many files.
 - Use glob_search to narrow candidate files by name or path pattern.
 - Use grep_search to find placeholders, TODOs, 'not implemented', specific symbols, or feature flags across the repo.
@@ -1682,6 +1929,7 @@ Respect the tool surface exactly. Do not invent unavailable tools. Prefer read-o
 - Prefer built-in file tools over ad-hoc shell inspection commands when `read_file`, `glob_search`, or `grep_search` already cover the need.
 - If `edit_file` fails because the target snippet no longer matches, the error message will show the actual file content at that location. Use those exact lines as your new `old_string` and retry immediately — do not call `read_file` again unless the error says the line was not found at all.
 - If `edit_file` fails a second time on the same location, stop retrying and use `write_file` to replace the entire function or section with a complete, correct version.
+- After successful file edits, CodeSharp may run an automatic verification command in the background and feed you a compact system note with the result. Use that result instead of immediately re-running the same build command yourself unless you need a narrower follow-up check.
 - Do not use `bash`, `PowerShell`, `head`, `tail`, `od`, `Get-Content`, or similar shell probes to inspect file contents when `read_file` can do it directly.
 - Shell-based file inspection of workspace files may be rejected; use `read_file` instead.",
             @"Whole-project analysis

@@ -6,6 +6,7 @@ public static class CommandHandlers
 {
     public static string RenderHelp(CommandRegistry registry)
     {
+        var visibleCommands = registry.VisibleCommands.OrderBy(c => c.Name).ToList();
         var lines = new List<string>
         {
             "Help",
@@ -15,7 +16,7 @@ public static class CommandHandlers
             "Commands"
         };
         
-        foreach (var cmd in registry.Commands.OrderBy(c => c.Name))
+        foreach (var cmd in visibleCommands)
         {
             var aliases = cmd.Aliases.Count > 0
                 ? $" ({string.Join(", ", cmd.Aliases)})"
