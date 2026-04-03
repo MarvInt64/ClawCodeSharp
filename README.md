@@ -1,6 +1,10 @@
-# CodeSharp - C#/.NET 10 Implementation
+# CodeSharp
 
-This is the C#/.NET 10 port of the original Rust implementation of Claw Code, now consistently branded as CodeSharp, with support for Anthropic, NVIDIA, OpenAI, and xAI providers plus a much better terminal UX.
+CodeSharp is a terminal-first coding assistant for .NET developers who want fast answers, clean repo navigation, and a CLI that feels built for real work instead of demos.
+
+Built as a modern C#/.NET 10 take on the original Claw Code, it brings Anthropic, NVIDIA, OpenAI, and xAI models into a sharper REPL with live streaming, readable markdown rendering, colored diff previews, clearer tool feedback, and smoother code-reading and editing workflows.
+
+It also adds practical features that matter in daily use: slash-command suggestions, guided config management, pinned full-screen REPL layout, parallel read-only repo analysis, smarter search output with context, and better handling for queued prompts, retries, and interrupt flow.
 
 ## Showcase
 

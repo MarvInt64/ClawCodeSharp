@@ -8,8 +8,8 @@ namespace CodeSharp.Cli;
 
 public class StreamingApiClient : IApiClient
 {
-    private readonly ProviderClient _client;
-    private readonly string _model;
+    private ProviderClient _client;
+    private string _model;
     private readonly IReadOnlyList<Api.ToolDefinition> _tools;
 
     public StreamingApiClient(ProviderClient client, string model, IReadOnlyList<Api.ToolDefinition> tools)
@@ -17,6 +17,12 @@ public class StreamingApiClient : IApiClient
         _client = client;
         _model = model;
         _tools = tools;
+    }
+
+    public void SwitchModel(string model, ProviderClient newClient)
+    {
+        _model = model;
+        _client = newClient;
     }
     
     public async Task<IReadOnlyList<AssistantEvent>> StreamAsync(

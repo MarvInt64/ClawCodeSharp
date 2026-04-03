@@ -413,6 +413,11 @@ public class ConversationRuntime
             return BuildToolPlanFallback(pendingToolUses);
         }
 
+        if (LooksLikeTruncatedPlanPreview(singleLine))
+        {
+            return BuildToolPlanFallback(pendingToolUses);
+        }
+
         if (!string.IsNullOrWhiteSpace(singleLine))
         {
             return singleLine;
@@ -444,6 +449,33 @@ public class ConversationRuntime
         }
 
         return "I'm gathering the relevant code context first.";
+    }
+
+    private static bool LooksLikeTruncatedPlanPreview(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return true;
+        }
+
+        var trimmed = text.TrimEnd();
+        var lastChar = trimmed[^1];
+        if (char.IsPunctuation(lastChar) && lastChar is not ',' and not ';')
+        {
+            return false;
+        }
+
+        var lastToken = trimmed
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .LastOrDefault()?
+            .Trim('"', '\'', ')', ']', '}', '.', ',', ';', ':', '!', '?');
+
+        if (string.IsNullOrEmpty(lastToken))
+        {
+            return true;
+        }
+
+        return lastToken.Length <= 2;
     }
 
     private static string? NormalizeAssistantLiveText(string text)

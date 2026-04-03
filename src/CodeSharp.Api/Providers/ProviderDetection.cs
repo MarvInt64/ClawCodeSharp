@@ -14,6 +14,7 @@ public static class ProviderDetection
     {
         var m when m.StartsWith("grok") => ProviderKind.Xai,
         var m when m.StartsWith("kimi") || m.Contains("moonshotai") || m.StartsWith("z-ai/") => ProviderKind.Nvidia,
+        var m when m.StartsWith("gpt-") || m.StartsWith("o1") || m.StartsWith("o3") || m.StartsWith("o4") => ProviderKind.OpenAi,
         _ => ProviderKind.CodeSharpApi
     };
     

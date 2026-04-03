@@ -1,4 +1,5 @@
 using System.Text;
+using CodeSharp.Core;
 
 namespace CodeSharp.Cli;
 
@@ -43,6 +44,23 @@ internal sealed class ReplConsole
     private IReadOnlyList<string> _activityPreview = [];
     private IReadOnlyList<string> _completionMatches = [];
     private int _completionIndex = -1;
+
+    // Input history
+    private readonly List<string> _history = [];
+    private int _historyIndex = -1;   // -1 = not browsing
+    private string _savedDraft = ""; // draft saved before entering history
+
+    // Cursor position within _draft (0 = before first char, _draft.Length = after last)
+    private int _cursorPos;
+
+    // Paste regions: large pastes stored in _draft at their real position,
+    // displayed as "[Pasted N lines]" labels instead of raw text.
+    private readonly record struct PasteRegion(int Start, int Length, int Lines, int Chars);
+    private readonly List<PasteRegion> _pasteRegions = [];
+    private const int PasteThresholdChars = 100;
+
+    // Token usage source for status bar display
+    private Func<TokenUsage>? _getTokenUsage;
 
     private static readonly string[] SpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -121,6 +139,14 @@ internal sealed class ReplConsole
         }
     }
 
+    public void SetTokenUsageSource(Func<TokenUsage> getUsage)
+    {
+        lock (_gate)
+        {
+            _getTokenUsage = getUsage;
+        }
+    }
+
     public bool ClearDraft()
     {
         lock (_gate)
@@ -131,6 +157,8 @@ internal sealed class ReplConsole
             }
 
             _draft.Clear();
+            _cursorPos = 0;
+            _pasteRegions.Clear();
             return true;
         }
     }
@@ -152,7 +180,17 @@ internal sealed class ReplConsole
                     var submitted = draftText.Trim();
 
                     _draft.Clear();
+                    _cursorPos = 0;
+                    _pasteRegions.Clear();
                     ResetCompletionStateLocked();
+                    ResetHistoryStateLocked();
+
+                    if (!string.IsNullOrEmpty(submitted))
+                    {
+                        // Add to history, avoid duplicates at the top
+                        if (_history.Count == 0 || _history[^1] != submitted)
+                            _history.Add(submitted);
+                    }
 
                     if (busy)
                     {
@@ -162,21 +200,125 @@ internal sealed class ReplConsole
                     return string.IsNullOrEmpty(submitted) ? null : new PromptSubmission(submitted);
                 }
                 case ConsoleKey.Backspace:
-                    if (_draft.Length > 0)
+                {
+                    var prLeft = FindPasteRegionEndingAtLocked(_cursorPos);
+                    if (prLeft is { } leftRegion)
                     {
-                        _draft.Length--;
+                        _draft.Remove(leftRegion.Start, leftRegion.Length);
+                        _cursorPos = leftRegion.Start;
+                        _pasteRegions.Remove(leftRegion);
+                        ShiftPasteRegionsAfterLocked(leftRegion.Start, -leftRegion.Length);
+                    }
+                    else if (_cursorPos > 0)
+                    {
+                        _draft.Remove(_cursorPos - 1, 1);
+                        _cursorPos--;
+                        ShiftPasteRegionsAfterLocked(_cursorPos, -1);
                     }
                     ResetCompletionStateLocked();
+                    ResetHistoryStateLocked();
                     break;
-                case ConsoleKey.Escape:
-                    _draft.Clear();
+                }
+                case ConsoleKey.Delete:
+                {
+                    var prRight = FindPasteRegionStartingAtLocked(_cursorPos);
+                    if (prRight is { } rightRegion)
+                    {
+                        _draft.Remove(rightRegion.Start, rightRegion.Length);
+                        _pasteRegions.Remove(rightRegion);
+                        ShiftPasteRegionsAfterLocked(_cursorPos, -rightRegion.Length);
+                    }
+                    else if (_cursorPos < _draft.Length)
+                    {
+                        _draft.Remove(_cursorPos, 1);
+                        ShiftPasteRegionsAfterLocked(_cursorPos, -1);
+                    }
                     ResetCompletionStateLocked();
+                    ResetHistoryStateLocked();
+                    break;
+                }
+                case ConsoleKey.J when (key.Modifiers & ConsoleModifiers.Control) != 0:
+                    _draft.Insert(_cursorPos, '\n');
+                    _cursorPos++;
+                    ResetCompletionStateLocked();
+                    ResetHistoryStateLocked();
+                    break;
+                case ConsoleKey.LeftArrow:
+                    if ((key.Modifiers & ConsoleModifiers.Control) != 0)
+                        _cursorPos = FindPreviousWordBoundaryLocked();
+                    else if (_cursorPos > 0)
+                    {
+                        _cursorPos--;
+                        // If we stepped into a paste region, jump to its start
+                        if (FindPasteRegionContainingLocked(_cursorPos) is { } pr)
+                            _cursorPos = pr.Start;
+                    }
+                    break;
+                case ConsoleKey.RightArrow:
+                    if ((key.Modifiers & ConsoleModifiers.Control) != 0)
+                        _cursorPos = FindNextWordBoundaryLocked();
+                    else if (_cursorPos < _draft.Length)
+                    {
+                        _cursorPos++;
+                        // If we stepped into a paste region, jump to its end
+                        if (FindPasteRegionContainingLocked(_cursorPos) is { } pr)
+                            _cursorPos = pr.Start + pr.Length;
+                    }
+                    break;
+                case ConsoleKey.Home:
+                    _cursorPos = 0;
+                    break;
+                case ConsoleKey.End:
+                    _cursorPos = _draft.Length;
+                    break;
+                case ConsoleKey.UpArrow:
+                    if (_history.Count > 0)
+                    {
+                        if (_historyIndex == -1)
+                        {
+                            // Save current draft before entering history
+                            _savedDraft = _draft.ToString();
+                            _historyIndex = _history.Count - 1;
+                        }
+                        else if (_historyIndex > 0)
+                        {
+                            _historyIndex--;
+                        }
+                        _draft.Clear();
+                        _draft.Append(_history[_historyIndex]);
+                        _cursorPos = _draft.Length;
+                        _pasteRegions.Clear();
+                        ResetCompletionStateLocked();
+                    }
+                    break;
+                case ConsoleKey.DownArrow:
+                    if (_historyIndex != -1)
+                    {
+                        _historyIndex++;
+                        if (_historyIndex >= _history.Count)
+                        {
+                            // Past the end — restore saved draft
+                            _draft.Clear();
+                            _draft.Append(_savedDraft);
+                            ResetHistoryStateLocked();
+                        }
+                        else
+                        {
+                            _draft.Clear();
+                            _draft.Append(_history[_historyIndex]);
+                        }
+                        _cursorPos = _draft.Length;
+                        _pasteRegions.Clear();
+                        ResetCompletionStateLocked();
+                    }
                     break;
                 default:
                     if (!char.IsControl(key.KeyChar))
                     {
-                        _draft.Append(key.KeyChar);
+                        _draft.Insert(_cursorPos, key.KeyChar);
+                        _cursorPos++;
                         ResetCompletionStateLocked();
+                        ResetHistoryStateLocked();
                     }
                     break;
             }
@@ -233,11 +375,13 @@ internal sealed class ReplConsole
     private void ReplaceDraftWithCompletionLocked(string completion, bool appendSpace)
     {
         _draft.Clear();
+        _pasteRegions.Clear();
         _draft.Append(completion);
         if (appendSpace)
         {
             _draft.Append(' ');
         }
+        _cursorPos = _draft.Length;
     }
 
     private void ResetCompletionStateLocked()
@@ -246,14 +390,116 @@ internal sealed class ReplConsole
         _completionIndex = -1;
     }
 
-    private string BuildPromptLineLocked()
+    private void ResetHistoryStateLocked()
     {
-        var draft = _draft.ToString();
-        var hint = BuildCompletionHintLocked();
-        return string.IsNullOrEmpty(hint)
-            ? $"{_prompt}{draft}"
-            : $"{_prompt}{draft}{hint}";
+        _historyIndex = -1;
+        _savedDraft = "";
     }
+
+    private PasteRegion? FindPasteRegionEndingAtLocked(int pos) =>
+        _pasteRegions.FirstOrDefault(r => r.Start + r.Length == pos) is { Length: > 0 } r2 ? r2 : null;
+
+    private PasteRegion? FindPasteRegionStartingAtLocked(int pos) =>
+        _pasteRegions.FirstOrDefault(r => r.Start == pos) is { Length: > 0 } r2 ? r2 : null;
+
+    private PasteRegion? FindPasteRegionContainingLocked(int pos) =>
+        _pasteRegions.FirstOrDefault(r => pos > r.Start && pos < r.Start + r.Length) is { Length: > 0 } r2 ? r2 : null;
+
+    private void ShiftPasteRegionsAfterLocked(int afterPos, int delta)
+    {
+        for (var i = 0; i < _pasteRegions.Count; i++)
+        {
+            if (_pasteRegions[i].Start >= afterPos)
+                _pasteRegions[i] = _pasteRegions[i] with { Start = _pasteRegions[i].Start + delta };
+        }
+    }
+
+    private int FindPreviousWordBoundaryLocked()
+    {
+        var pos = _cursorPos;
+        while (pos > 0 && _draft[pos - 1] == ' ') pos--;
+        while (pos > 0 && _draft[pos - 1] != ' ') pos--;
+        return pos;
+    }
+
+    private int FindNextWordBoundaryLocked()
+    {
+        var pos = _cursorPos;
+        while (pos < _draft.Length && _draft[pos] != ' ') pos++;
+        while (pos < _draft.Length && _draft[pos] == ' ') pos++;
+        return pos;
+    }
+
+    private IReadOnlyList<string> BuildPromptLinesLocked()
+    {
+        var displayDraft = BuildDisplayDraftLocked();
+        var draftLines = displayDraft.Split('\n');
+        var result = new List<string>(draftLines.Length);
+
+        for (var i = 0; i < draftLines.Length; i++)
+        {
+            var lineText = draftLines[i];
+            if (i == 0 && draftLines.Length == 1)
+            {
+                // Single-line: first line with prompt and completion hint
+                var hint = BuildCompletionHintLocked();
+                result.Add(string.IsNullOrEmpty(hint)
+                    ? $"{_prompt}{lineText}"
+                    : $"{_prompt}{lineText}{hint}");
+            }
+            else if (i == 0)
+            {
+                // First line of multiline
+                result.Add($"{_prompt}{lineText}");
+            }
+            else
+            {
+                // Continuation lines: indent to match prompt width
+                result.Add($"  {lineText}");
+            }
+        }
+
+        return result;
+    }
+
+    private string BuildDisplayDraftLocked()
+    {
+        if (_pasteRegions.Count == 0) return _draft.ToString();
+
+        var sb = new StringBuilder();
+        var pos = 0;
+        foreach (var region in _pasteRegions.OrderBy(r => r.Start))
+        {
+            if (region.Start > pos)
+                sb.Append(_draft, pos, region.Start - pos);
+            sb.Append(FormatPasteLabel(region));
+            pos = region.Start + region.Length;
+        }
+        if (pos < _draft.Length)
+            sb.Append(_draft, pos, _draft.Length - pos);
+        return sb.ToString();
+    }
+
+    private int DisplayCursorPosLocked()
+    {
+        if (_pasteRegions.Count == 0) return _cursorPos;
+
+        var displayPos = _cursorPos;
+        foreach (var region in _pasteRegions.OrderBy(r => r.Start))
+        {
+            if (region.Start >= _cursorPos) break;
+            var regionEnd = region.Start + region.Length;
+            var overlap = Math.Min(regionEnd, _cursorPos) - region.Start;
+            displayPos -= overlap;
+            displayPos += FormatPasteLabel(region).Length;
+        }
+        return displayPos;
+    }
+
+    private static string FormatPasteLabel(PasteRegion region) =>
+        region.Lines > 1
+            ? $"[Pasted {region.Lines} lines]"
+            : $"[Pasted {region.Chars} chars]";
 
     private string BuildCompletionHintLocked()
     {
@@ -291,7 +537,8 @@ internal sealed class ReplConsole
     private string? GetCurrentSlashTokenLocked()
     {
         var draft = _draft.ToString();
-        if (!draft.StartsWith("/", StringComparison.Ordinal))
+        // Slash completion only available on single-line drafts with no paste blocks
+        if (!draft.StartsWith("/", StringComparison.Ordinal) || draft.Contains('\n') || _pasteRegions.Count > 0)
         {
             return null;
         }
@@ -391,19 +638,102 @@ internal sealed class ReplConsole
         }
     }
 
+    /// <summary>
+    /// Clears the live busy frame, commits <paramref name="content"/> to terminal scroll
+    /// history (so prior turns remain visible), then renders the idle prompt.
+    /// </summary>
+    public void LeaveBusyAndCommit(string? content)
+    {
+        lock (_gate)
+        {
+            ClearRenderedBlockLocked(_bodyRenderLines);
+            _bodyRenderLines = 0;
+            _busyVisible = false;
+            _queuedPreview = [];
+            _activityPreview = [];
+            _contentLines = [];
+
+            if (!string.IsNullOrEmpty(content))
+                Console.WriteLine(content);
+
+            RenderIdleLocked();
+        }
+    }
+
+    /// <summary>
+    /// Clears the current live area and commits <paramref name="content"/> to terminal
+    /// scroll history without re-rendering. Call before <see cref="EnterBusy"/>.
+    /// </summary>
+    public void CommitToHistory(string content)
+    {
+        lock (_gate)
+        {
+            ClearRenderedBlockLocked(_bodyRenderLines);
+            _bodyRenderLines = 0;
+            _contentLines = [];
+
+            if (!string.IsNullOrEmpty(content))
+                Console.WriteLine(content);
+            // Caller will invoke EnterBusy which renders next
+        }
+    }
+
+    /// <summary>
+    /// Inserts pasted text at the current cursor position. Large pastes are shown
+    /// as a compact "[Pasted N lines]" label; small pastes are inserted inline.
+    /// </summary>
+    public void HandlePaste(string text, bool busy)
+    {
+        lock (_gate)
+        {
+            var normalized = text.Replace("\r\n", "\n").Replace('\r', '\n');
+            var lineCount = normalized.Count(c => c == '\n') + 1;
+            var charCount = normalized.Length;
+
+            // Shift existing regions that start at or after cursor
+            ShiftPasteRegionsAfterLocked(_cursorPos, normalized.Length);
+
+            _draft.Insert(_cursorPos, normalized);
+
+            if (charCount >= PasteThresholdChars || lineCount > 1)
+            {
+                // Large or multiline paste: track as a paste region (shown as label)
+                _pasteRegions.Add(new PasteRegion(_cursorPos, normalized.Length, lineCount, charCount));
+            }
+
+            _cursorPos += normalized.Length;
+            ResetCompletionStateLocked();
+            ResetHistoryStateLocked();
+
+            if (busy) RenderBusyFrameLocked();
+            else RenderIdleLocked();
+        }
+    }
+
     private string BuildStatus(string label)
     {
         var frame = SpinnerFrames[_spinnerIndex % SpinnerFrames.Length];
         _spinnerIndex++;
 
-        var parts = new List<string> { $"{frame} {label}", "Ctrl+C cancels" };
+        var parts = new List<string> { $"{frame} {label}", "ESC cancels" };
         if (_queuedPreview.Count > 0)
         {
             parts.Add(_queuedPreview.Count == 1 ? "1 queued" : $"{_queuedPreview.Count} queued");
         }
 
+        var usage = _getTokenUsage?.Invoke();
+        if (usage is not null && usage.TotalTokens > 0)
+        {
+            parts.Add(FormatTokenCount(usage.TotalTokens));
+        }
+
         return string.Join(" · ", parts);
     }
+
+    private static string FormatTokenCount(long tokens) =>
+        tokens >= 1_000_000 ? $"{tokens / 1_000_000.0:F1}M tok"
+        : tokens >= 1_000 ? $"{tokens / 1_000.0:F1}k tok"
+        : $"{tokens} tok";
 
     private void RenderBusyFrameLocked()
     {
@@ -447,7 +777,7 @@ internal sealed class ReplConsole
             ));
         }
         lines.Add(BuildStatus(_busyLabel));
-        lines.Add(BuildPromptLineLocked());
+        lines.AddRange(BuildPromptLinesLocked());
 
         RenderBodyLocked(lines);
     }
@@ -462,6 +792,38 @@ internal sealed class ReplConsole
         ClearRenderedBlockLocked(_bodyRenderLines);
         WriteBlockLocked(lines);
         _bodyRenderLines = lines.Count;
+        PositionCursorAfterRenderLocked();
+    }
+
+    private void PositionCursorAfterRenderLocked()
+    {
+        var displayDraft = BuildDisplayDraftLocked();
+        var displayCursor = DisplayCursorPosLocked();
+        var displayCursor2 = Math.Min(displayCursor, displayDraft.Length);
+        var displayLines = displayDraft.Split('\n');
+
+        // Find which row/col the display cursor is in
+        var beforeCursor = displayDraft[..displayCursor2];
+        var beforeLines = beforeCursor.Split('\n');
+        var cursorRow = beforeLines.Length - 1;
+        var cursorCol = beforeLines[^1].Length;
+        var totalRows = displayLines.Length;
+
+        // Move up from the bottom of the rendered prompt to the cursor's row
+        var rowsAfterCursor = totalRows - 1 - cursorRow;
+        if (rowsAfterCursor > 0)
+            Console.Write($"\u001b[{rowsAfterCursor}A");
+
+        // Move left to cursor column within that row
+        var cursorLineInDisplay = displayLines[cursorRow];
+        var charsAfterCursor = cursorLineInDisplay.Length - cursorCol;
+
+        // Add hint chars (only shown on single-line, no-paste drafts)
+        if (totalRows == 1 && _pasteRegions.Count == 0)
+            charsAfterCursor += VisibleLength(BuildCompletionHintLocked());
+
+        if (charsAfterCursor > 0)
+            Console.Write($"\u001b[{charsAfterCursor}D");
     }
 
     private List<string> BuildContentLinesLocked()
@@ -554,7 +916,12 @@ internal sealed class ReplConsole
     {
         var lines = BuildContentLinesLocked();
         lines.AddRange(BuildSuggestionLinesLocked());
-        lines.Add(BuildPromptLineLocked());
+        var usage = _getTokenUsage?.Invoke();
+        if (usage is not null && usage.TotalTokens > 0 && _contentLines.Count == 0)
+        {
+            lines.Add(ConsoleUi.Muted($"  {FormatTokenCount(usage.TotalTokens)} used this session"));
+        }
+        lines.AddRange(BuildPromptLinesLocked());
         return lines;
     }
 

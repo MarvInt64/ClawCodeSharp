@@ -1,9 +1,12 @@
 using System.Diagnostics;
 using System.Text;
+using CodeSharp.Api;
 using CodeSharp.Commands;
 using CodeSharp.Core;
 
 namespace CodeSharp.Cli;
+
+public record SlashCommandResult(bool Consumed, string? NewBusyLabel = null);
 
 public class ReplSession
 {
@@ -11,16 +14,18 @@ public class ReplSession
     private const int DiffMaxLines = 200;
 
     private readonly ConversationRuntime _runtime;
-    private readonly string _model;
-    private readonly string _provider;
+    private string _model;
+    private string _provider;
     private readonly PermissionMode _permissionMode;
     private readonly CommandRegistry _commandRegistry;
     private readonly UsageTracker _usageTracker;
     private readonly string _sessionPath;
     private readonly GlobalSettingsStore _globalSettingsStore;
+    private readonly StreamingApiClient _apiClient;
 
     public ReplSession(
         ConversationRuntime runtime,
+        StreamingApiClient apiClient,
         string model,
         string provider,
         PermissionMode permissionMode,
@@ -28,6 +33,7 @@ public class ReplSession
     )
     {
         _runtime = runtime;
+        _apiClient = apiClient;
         _model = model;
         _provider = provider;
         _permissionMode = permissionMode;
@@ -61,17 +67,17 @@ public class ReplSession
                 ("Permissions", _permissionMode.AsString()),
                 ("Session", Path.GetFileNameWithoutExtension(_sessionPath))
             ],
-            "/help · /config · /status · type while thinking to queue · Ctrl+C cancels · Ctrl+C twice asks to quit"
+            "/help · /config · /status · type while thinking to queue · ESC cancels · Ctrl+C quits"
         );
     }
 
-    public async Task<bool> HandleCommandAsync(SlashCommand command)
+    public async Task<SlashCommandResult> HandleCommandAsync(SlashCommand command)
     {
         switch (command.Kind)
         {
             case SlashCommandKind.Help:
                 Console.WriteLine(CommandHandlers.RenderHelp(_commandRegistry));
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Status:
                 Console.WriteLine(CommandHandlers.RenderStatus(
@@ -82,32 +88,38 @@ public class ReplSession
                     _usageTracker.CumulativeUsage().TotalTokens,
                     GetGitBranch()
                 ));
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Cost:
                 Console.WriteLine(CommandHandlers.RenderCost(_usageTracker.CumulativeUsage(), _usageTracker.Turns()));
-                return false;
+                return new SlashCommandResult(false);
+
+            case SlashCommandKind.Model when !string.IsNullOrWhiteSpace(command.Args):
+            {
+                var newBusyLabel = SwitchModel(command.Args.Trim());
+                return new SlashCommandResult(false, newBusyLabel);
+            }
 
             case SlashCommandKind.Model:
                 Console.WriteLine(CommandHandlers.RenderModelReport(_model, _runtime.Session.Messages.Count, _usageTracker.Turns()));
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Permissions:
                 Console.WriteLine(CommandHandlers.RenderPermissionsReport(_permissionMode.AsString()));
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Version:
                 Console.WriteLine(CommandHandlers.RenderVersion("0.1.0"));
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Export:
                 await ExportSessionAsync(command.Path);
-                return true;
+                return new SlashCommandResult(true);
 
             case SlashCommandKind.Clear when command.Confirm == true:
                 _runtime.Session.Clear();
                 Console.WriteLine(ConsoleUi.MessageBlock("session", "Session history cleared."));
-                return true;
+                return new SlashCommandResult(true);
 
             case SlashCommandKind.Clear:
                 Console.WriteLine(ConsoleUi.MessageBlock(
@@ -115,65 +127,121 @@ public class ReplSession
                     "Confirmation required.",
                     "Run /clear --confirm to remove the current session history."
                 ));
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Compact:
                 await CompactSessionAsync();
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Diff:
                 await HandleDiffAsync();
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Commit:
                 await HandleCommitAsync();
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Init:
                 Console.WriteLine(ConsoleUi.MessageBlock("init", "Init from inside REPL is not implemented yet."));
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Config:
             {
+                var previousSettings = _globalSettingsStore.Load();
                 var headerLines = StartupBanner().Replace("\r\n", "\n").Split('\n');
                 var result = ConfigCommandProcessor.Process(command.Section, _globalSettingsStore, headerLines);
+                var updatedSettings = _globalSettingsStore.Load();
+                string? newBusyLabel = null;
                 var footer = string.IsNullOrWhiteSpace(command.Section)
                     ? "Global defaults apply to new CodeSharp sessions."
                     : result.Footer;
+
+                if (updatedSettings != previousSettings)
+                {
+                    newBusyLabel = ApplyGlobalSettingsToCurrentSession(updatedSettings);
+                    footer = string.IsNullOrWhiteSpace(footer)
+                        ? "Applied to the current REPL session."
+                        : $"{footer}\nApplied to the current REPL session.";
+                }
+
                 Console.WriteLine(ConsoleUi.MessageBlock(result.Title, result.Body, footer));
-                return false;
+                return new SlashCommandResult(false, newBusyLabel);
             }
 
             case SlashCommandKind.Memory:
                 Console.WriteLine(ConsoleUi.MessageBlock("memory", "Memory inspection is not implemented yet."));
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Agents:
                 Console.WriteLine(ConsoleUi.MessageBlock("agents", "Agent management in REPL is not implemented yet."));
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Skills:
                 Console.WriteLine(ConsoleUi.MessageBlock("skills", "Skill management in REPL is not implemented yet."));
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Plugins:
                 Console.WriteLine(ConsoleUi.MessageBlock("plugins", "Plugin management in REPL is not implemented yet."));
-                return false;
+                return new SlashCommandResult(false);
 
             case SlashCommandKind.Unknown:
                 Console.WriteLine(ConsoleUi.ErrorBlock(
                     $"Unknown command: /{command.Name}\nType /help for available commands."
                 ));
-                return false;
+                return new SlashCommandResult(false);
 
             default:
                 Console.WriteLine(ConsoleUi.MessageBlock(
                     "todo",
                     $"Command '{command.Kind}' is not implemented yet."
                 ));
-                return false;
+                return new SlashCommandResult(false);
         }
     }
+
+    private string SwitchModel(string modelInput)
+    {
+        var resolvedModel = ProviderDetection.ResolveModelAlias(modelInput);
+        var providerKind = ProviderDetection.DetectProviderKind(resolvedModel);
+        var settings = _globalSettingsStore.Load();
+        var apiKey = settings.GetApiKey(providerKind);
+        var newClient = ProviderClient.FromProvider(providerKind, apiKey);
+
+        _apiClient.SwitchModel(resolvedModel, newClient);
+        _model = resolvedModel;
+        _provider = FormatProvider(providerKind);
+
+        var busyLabel = $"Thinking with {_provider} · {_model}";
+        Console.WriteLine(ConsoleUi.MessageBlock(
+            "model",
+            $"Switched to {_model}",
+            $"Provider: {_provider}"
+        ));
+        return busyLabel;
+    }
+
+    private string ApplyGlobalSettingsToCurrentSession(GlobalSettings settings)
+    {
+        var effectiveModel = settings.Model ?? _model;
+        var effectiveProvider = settings.GetProviderKind() ?? ProviderDetection.DetectProviderKind(effectiveModel);
+        var apiKey = settings.GetApiKey(effectiveProvider);
+        var newClient = ProviderClient.FromProvider(effectiveProvider, apiKey);
+
+        _apiClient.SwitchModel(effectiveModel, newClient);
+        _model = effectiveModel;
+        _provider = FormatProvider(effectiveProvider);
+
+        return $"Thinking with {_provider} · {_model}";
+    }
+
+    private static string FormatProvider(ProviderKind provider) => provider switch
+    {
+        ProviderKind.CodeSharpApi => "anthropic",
+        ProviderKind.OpenAi => "openai",
+        ProviderKind.Xai => "xai",
+        ProviderKind.Nvidia => "nvidia",
+        _ => provider.ToString().ToLowerInvariant()
+    };
 
     // ── /compact ────────────────────────────────────────────────────────────────
 

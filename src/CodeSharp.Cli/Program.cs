@@ -144,6 +144,29 @@ internal sealed class TurnActivityState
         }
     }
 
+    public IReadOnlyList<string> PersistentEditSnapshot()
+    {
+        lock (_gate)
+        {
+            var output = new List<string>();
+            foreach (var line in _lines.Where(ShouldPersistAfterTurn))
+            {
+                if (output.Count > 0 && output[^1].Length > 0)
+                {
+                    output.Add(string.Empty);
+                }
+
+                output.AddRange(Program.FormatActivityLines(line));
+            }
+
+            return output;
+        }
+    }
+
+    private static bool ShouldPersistAfterTurn(ActivityLine line) =>
+        line.ToolName is "edit_file" or "write_file" &&
+        (line.DetailLines?.Count > 0 || line.Status is ActivityLineStatus.Error or ActivityLineStatus.Blocked);
+
     private int FindLastRunningIndex(string toolUseId)
     {
         for (var i = _lines.Count - 1; i >= 0; i--)
@@ -293,6 +316,7 @@ public static class Program
 {
     private const string Version = "0.1.0";
     private static readonly TimeSpan ExitInterruptWindow = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan PasteSubmitGuardWindow = TimeSpan.FromMilliseconds(300);
     private static readonly HashSet<string> HiddenModelTools = new(StringComparer.Ordinal)
     {
         "REPL",
@@ -558,7 +582,7 @@ Add any additional context about the project.
         Directory.CreateDirectory(Path.GetDirectoryName(sessionPath)!);
         var provider = options.Provider ?? ProviderClient.DetectProviderKind(options.Model);
         
-        var (runtime, _, _) = BuildRuntime(options, sessionPath);
+        var (runtime, _, _, _) = BuildRuntime(options, sessionPath);
 
         try
         {
@@ -621,11 +645,12 @@ Add any additional context about the project.
         var sessionPath = Path.Combine(cwd, ".codesharp", "sessions", $"session-{DateTime.UtcNow:yyyyMMdd-HHmmss}.json");
         Directory.CreateDirectory(Path.GetDirectoryName(sessionPath)!);
         
-        var (runtime, _, _) = BuildRuntime(options, sessionPath);
+        var (runtime, _, _, apiClient) = BuildRuntime(options, sessionPath);
         var provider = options.Provider ?? ProviderClient.DetectProviderKind(options.Model);
-        
+
         var repl = new ReplSession(
             runtime,
+            apiClient,
             options.Model,
             FormatProvider(provider),
             options.PermissionMode,
@@ -638,11 +663,13 @@ Add any additional context about the project.
             repl.CompletionCandidates,
             repl.StartupBanner().Replace("\r\n", "\n").Split('\n')
         );
+        console.SetTokenUsageSource(() => repl.Usage.CumulativeUsage());
         var busyLabel = $"Thinking with {FormatProvider(provider)} · {options.Model}";
         var queuedInputs = new Queue<string>();
         ActiveTurn? activeTurn = null;
         var exitRequested = false;
-        DateTimeOffset? lastInterruptAt = null;
+        // Tracks a short guard window so a trailing Enter from the paste stream is not treated as Submit.
+        var suppressSubmitAfterPasteUntil = DateTime.MinValue;
         IPermissionPrompter? prompter = repl.PermissionMode != PermissionMode.DangerFullAccess
             ? new ReplPermissionPrompter(repl.PermissionMode)
             : null;
@@ -655,36 +682,8 @@ Add any additional context about the project.
         {
             if (interrupts.ConsumeRequested())
             {
-                var now = DateTimeOffset.UtcNow;
-                var doubleInterrupt = lastInterruptAt is { } last && now - last <= ExitInterruptWindow;
-                lastInterruptAt = now;
-
-                if (doubleInterrupt)
-                {
-                    exitRequested = await ConfirmExitAsync(console, activeTurn, busyLabel, queuedInputs);
-                    if (!exitRequested)
-                    {
-                        lastInterruptAt = null;
-                    }
-                    continue;
-                }
-
-                if (activeTurn is not null && !activeTurn.Cancellation.IsCancellationRequested)
-                {
-                    activeTurn.Cancellation.Cancel();
-                }
-                else
-                {
-                    console.SetContent(ConsoleUi.Warning("Press Ctrl+C again to quit."));
-                    if (activeTurn is not null)
-                    {
-                        console.EnterBusy(busyLabel, queuedInputs, activeTurn.Activity.Snapshot());
-                    }
-                    else
-                    {
-                        console.RenderIdlePrompt();
-                    }
-                }
+                exitRequested = await ConfirmExitAsync(console, activeTurn, busyLabel, queuedInputs);
+                continue;
             }
 
             if (activeTurn is not null && activeTurn.Task.IsCompleted)
@@ -693,30 +692,27 @@ Add any additional context about the project.
                 activeTurn = null;
 
                 var result = await completed.Task;
-                console.LeaveBusy();
+                var persistentEditLines = completed.Activity.PersistentEditSnapshot();
 
+                string committedContent;
                 if (result.Interrupted)
-                {
-                    console.SetContent(ConsoleUi.Warning("Request canceled."));
-                }
+                    committedContent = ConsoleUi.Warning("Request canceled.");
                 else if (result.Error is not null)
-                {
-                    console.SetContent(ConsoleUi.ErrorBlock(result.Error));
-                }
+                    committedContent = ConsoleUi.ErrorBlock(result.Error);
                 else
-                {
-                    console.SetContent(ConsoleUi.AssistantTurn(
+                    committedContent = ConsoleUi.AssistantTurn(
                         ExtractAssistantText(result.Summary!),
                         result.Summary!.Usage,
                         ExtractToolNames(result.Summary!),
                         result.Summary!.Iterations
-                    ));
+                    );
+
+                if (persistentEditLines.Count > 0)
+                {
+                    committedContent = $"{ConsoleUi.MessageBlock("edits", persistentEditLines)}\n{committedContent}";
                 }
 
-                if (queuedInputs.Count == 0)
-                {
-                    console.RenderIdlePrompt();
-                }
+                console.LeaveBusyAndCommit(committedContent);
 
                 continue;
             }
@@ -732,7 +728,8 @@ Add any additional context about the project.
                     queuedInputs,
                     console,
                     prompter,
-                    turn => activeTurn = turn
+                    turn => activeTurn = turn,
+                    newLabel => busyLabel = newLabel
                 );
                 if (!exitRequested && activeTurn is null)
                 {
@@ -743,8 +740,65 @@ Add any additional context about the project.
 
             if (TryReadConsoleKey(out var key))
             {
-                lastInterruptAt = null;
-                var submission = console.HandleKey(key, activeTurn is not null);
+                // ESC: cancel active turn, or clear draft if no active turn
+                if (key.Key == ConsoleKey.Escape)
+                {
+                    if (activeTurn is not null && !activeTurn.Cancellation.IsCancellationRequested)
+                    {
+                        activeTurn.Cancellation.Cancel();
+                    }
+                    else
+                    {
+                        console.ClearDraft();
+                        console.RenderIdlePrompt();
+                    }
+                    continue;
+                }
+
+                // Paste detection: first printable char + more keys immediately available
+                PromptSubmission? submission;
+                if (!char.IsControl(key.KeyChar) && Console.KeyAvailable && !ReplPermissionPrompter.IsConsoleActive)
+                {
+                    var pasteBuffer = new System.Text.StringBuilder();
+                    pasteBuffer.Append(key.KeyChar);
+                    while (Console.KeyAvailable && !ReplPermissionPrompter.IsConsoleActive)
+                    {
+                        var next = Console.ReadKey(intercept: true);
+                        if (next.Key == ConsoleKey.Enter)
+                            pasteBuffer.Append('\n');
+                        else if (!char.IsControl(next.KeyChar))
+                            pasteBuffer.Append(next.KeyChar);
+                        else
+                            break; // stop at other control chars
+                    }
+
+                    if (pasteBuffer.Length > 1)
+                    {
+                        console.HandlePaste(pasteBuffer.ToString(), activeTurn is not null);
+                        suppressSubmitAfterPasteUntil = DateTime.UtcNow + PasteSubmitGuardWindow;
+                        submission = null;
+                    }
+                    else
+                    {
+                        submission = console.HandleKey(key, activeTurn is not null);
+                    }
+                }
+                else
+                {
+                    submission = console.HandleKey(key, activeTurn is not null);
+                }
+
+                // Guard: swallow the next Enter that arrives immediately after a paste.
+                if (key.Key == ConsoleKey.Enter && DateTime.UtcNow <= suppressSubmitAfterPasteUntil)
+                {
+                    submission = null;
+                    suppressSubmitAfterPasteUntil = DateTime.MinValue;
+                }
+                else if (key.Key == ConsoleKey.Enter)
+                {
+                    suppressSubmitAfterPasteUntil = DateTime.MinValue;
+                }
+
                 if (submission is { } queuedSubmission)
                 {
                     if (activeTurn is not null)
@@ -762,7 +816,8 @@ Add any additional context about the project.
                             queuedInputs,
                             console,
                             prompter,
-                            turn => activeTurn = turn
+                            turn => activeTurn = turn,
+                            newLabel => busyLabel = newLabel
                         );
                         if (!exitRequested && activeTurn is null)
                         {
@@ -1324,7 +1379,8 @@ Add any additional context about the project.
         Queue<string> queuedInputs,
         ReplConsole console,
         IPermissionPrompter? prompter,
-        Action<ActiveTurn> setActiveTurn
+        Action<ActiveTurn> setActiveTurn,
+        Action<string>? onBusyLabelChanged = null
     )
     {
         var trimmed = input.Trim();
@@ -1343,14 +1399,16 @@ Add any additional context about the project.
             var command = SlashCommand.Parse(trimmed);
             if (command is not null)
             {
-                await repl.HandleCommandAsync(command);
+                var result = await repl.HandleCommandAsync(command);
+                if (result.NewBusyLabel is not null)
+                    onBusyLabelChanged?.Invoke(result.NewBusyLabel);
                 return false;
             }
         }
 
         var cts = new CancellationTokenSource();
         var activity = new TurnActivityState();
-        console.SetContent(ConsoleUi.UserTurn(trimmed));
+        console.CommitToHistory(ConsoleUi.UserTurn(trimmed));
         var task = ExecuteTurnAsync(runtime, trimmed, activity, prompter, cts.Token);
         setActiveTurn(new ActiveTurn(task, cts, activity));
         console.EnterBusy(busyLabel, queuedInputs, activity.Snapshot());
@@ -1450,7 +1508,7 @@ Add any additional context about the project.
         }
     }
     
-    private static (ConversationRuntime, GlobalToolRegistry, ToolExecutor) BuildRuntime(CliOptions options, string sessionPath)
+    private static (ConversationRuntime, GlobalToolRegistry, ToolExecutor, StreamingApiClient) BuildRuntime(CliOptions options, string sessionPath)
     {
         var cwd = Directory.GetCurrentDirectory();
         var globalSettings = new GlobalSettingsStore().Load();
@@ -1501,7 +1559,7 @@ Add any additional context about the project.
             systemPrompt
         );
         
-        return (runtime, registry, toolExecutor);
+        return (runtime, registry, toolExecutor, apiClient);
     }
 
     private static IReadOnlyList<string> BuildSystemPrompt(
@@ -1556,6 +1614,13 @@ Respect the tool surface exactly. Do not invent unavailable tools. Prefer read-o
 - If `edit_file` fails a second time on the same location, stop retrying and use `write_file` to replace the entire function or section with a complete, correct version.
 - Do not use `bash`, `PowerShell`, `head`, `tail`, `od`, `Get-Content`, or similar shell probes to inspect file contents when `read_file` can do it directly.
 - Shell-based file inspection of workspace files may be rejected; use `read_file` instead.",
+            @"Whole-project analysis
+- When asked to review, analyze, or improve 'the project' or 'the codebase' broadly, do NOT dive deep into a single file. Instead, follow this order:
+  1. Run glob_search('src/**/*.cs') (or the appropriate pattern) to enumerate all source files.
+  2. Skim 4-8 representative files spread across different layers (entry points, core logic, data access, UI/CLI, tests) using small read_file slices (limit 40-80 lines each).
+  3. Only after that broad scan, give a balanced assessment that references multiple files and layers — not just whichever file happened to be largest or first.
+- A good broad review mentions: entry points, domain/business logic, infrastructure, error handling, tests, CI/CD, and security — spread across the actual files found.
+- Do not let one large file dominate a broad analysis simply because it is large.",
             @"Search and verification rules
 - Do not claim that something is absent from the codebase unless the relevant search result actually returned zero matches.
 - For broad repo questions, prefer at least one broad search and one targeted follow-up search before concluding nothing was found.
