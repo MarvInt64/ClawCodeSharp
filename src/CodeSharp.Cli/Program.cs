@@ -144,7 +144,7 @@ internal sealed class TurnActivityState
         }
     }
 
-    public IReadOnlyList<string> PersistentEditSnapshot()
+    public IReadOnlyList<string> PersistentTurnSnapshot()
     {
         lock (_gate)
         {
@@ -164,8 +164,7 @@ internal sealed class TurnActivityState
     }
 
     private static bool ShouldPersistAfterTurn(ActivityLine line) =>
-        line.ToolName is "edit_file" or "write_file" &&
-        (line.DetailLines?.Count > 0 || line.Status is ActivityLineStatus.Error or ActivityLineStatus.Blocked);
+        line.ToolName != "assistant_draft";
 
     private int FindLastRunningIndex(string toolUseId)
     {
@@ -692,7 +691,7 @@ Add any additional context about the project.
                 activeTurn = null;
 
                 var result = await completed.Task;
-                var persistentEditLines = completed.Activity.PersistentEditSnapshot();
+                var persistentTurnLines = completed.Activity.PersistentTurnSnapshot();
 
                 string committedContent;
                 if (result.Interrupted)
@@ -707,9 +706,9 @@ Add any additional context about the project.
                         result.Summary!.Iterations
                     );
 
-                if (persistentEditLines.Count > 0)
+                if (persistentTurnLines.Count > 0)
                 {
-                    committedContent = $"{ConsoleUi.MessageBlock("edits", persistentEditLines)}\n{committedContent}";
+                    committedContent = $"{ConsoleUi.MessageBlock("activity", persistentTurnLines)}\n{committedContent}";
                 }
 
                 console.LeaveBusyAndCommit(committedContent);
