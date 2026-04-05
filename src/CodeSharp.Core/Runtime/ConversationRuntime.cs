@@ -15,7 +15,12 @@ public class ConversationRuntime
         "glob_search",
         "grep_search",
         "find_symbol",
-        "find_references"
+        "find_references",
+        "TaskCreate",
+        "TaskGet",
+        "TaskList",
+        "EnterPlanMode",
+        "ExitPlanMode"
     };
 
     private static readonly HashSet<string> MutatingFileTools = new(StringComparer.Ordinal)
@@ -34,6 +39,7 @@ public class ConversationRuntime
     private readonly UsageTracker _usageTracker;
     private readonly HookRunner _hookRunner;
     private readonly int _maxIterations;
+    private string? _planningDepth;
     
     public const string UserInterruptMessage = "request interrupted by user";
     
@@ -62,6 +68,12 @@ public class ConversationRuntime
     
     public Session Session => _session;
     public UsageTracker Usage => _usageTracker;
+    public AgentExecutionMode Mode { get; set; } = AgentExecutionMode.Execute;
+    public string? PlanningDepth
+    {
+        get => _planningDepth;
+        set => _planningDepth = string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+    }
 
     public ConversationRuntimeCheckpoint CaptureCheckpoint() =>
         new(_session.Count, _usageTracker.Snapshot());
@@ -95,7 +107,7 @@ public class ConversationRuntime
                 throw new RuntimeError("conversation loop exceeded the maximum number of iterations");
             }
             
-            var request = new ApiRequest(_systemPrompt, _session.Messages);
+            var request = new ApiRequest(BuildRequestSystemPrompt(), _session.Messages);
             var liveAssistantText = new StringBuilder();
             var lastDraft = string.Empty;
             var events = await _apiClient.StreamAsync(
@@ -263,6 +275,34 @@ public class ConversationRuntime
         CancellationToken cancellationToken
     )
     {
+        if (toolName == "EnterPlanMode")
+        {
+            Mode = AgentExecutionMode.Planning;
+            var modeResult = JsonSerializer.Serialize(new { switched = true, mode = "planning" });
+            activitySink?.Invoke(new RuntimeActivity.ToolStarted(toolUseId, toolName, input));
+            activitySink?.Invoke(new RuntimeActivity.ToolFinished(toolUseId, toolName, modeResult, false));
+            var modeMsg = ConversationMessage.ToolResult(toolUseId, toolName, modeResult, false);
+            return new PreparedToolExecution(index, _ => Task.FromResult(modeMsg));
+        }
+
+        if (toolName == "ExitPlanMode")
+        {
+            Mode = AgentExecutionMode.Execute;
+            var modeResult = JsonSerializer.Serialize(new { switched = true, mode = "execute" });
+            activitySink?.Invoke(new RuntimeActivity.ToolStarted(toolUseId, toolName, input));
+            activitySink?.Invoke(new RuntimeActivity.ToolFinished(toolUseId, toolName, modeResult, false));
+            var modeMsg = ConversationMessage.ToolResult(toolUseId, toolName, modeResult, false);
+            return new PreparedToolExecution(index, _ => Task.FromResult(modeMsg));
+        }
+
+        if (Mode == AgentExecutionMode.Planning && IsBlockedInPlanningMode(toolName))
+        {
+            var reason = $"Planning mode blocks `{toolName}`. Use read-only inspection and produce a plan, then switch back to execute mode to make changes.";
+            activitySink?.Invoke(new RuntimeActivity.ToolBlocked(toolUseId, toolName, reason));
+            var blocked = ConversationMessage.ToolResult(toolUseId, toolName, reason, true);
+            return new PreparedToolExecution(index, _ => Task.FromResult(blocked));
+        }
+
         var permissionResult = prompter is not null
             ? _permissionPolicy.Authorize(toolName, input, prompter)
             : _permissionPolicy.Authorize(toolName, input);
@@ -344,6 +384,16 @@ public class ConversationRuntime
     }
 
     private static bool IsParallelSafeTool(string toolName) => ParallelSafeTools.Contains(toolName);
+
+    private bool IsBlockedInPlanningMode(string toolName)
+    {
+        if (toolName is "bash" or "PowerShell" or "REPL" or "Agent" or "NotebookEdit" or "Config" or "TodoWrite")
+        {
+            return true;
+        }
+
+        return _permissionPolicy.RequiredPermissionFor(toolName) != PermissionMode.ReadOnly;
+    }
 
     private async Task<ConversationMessage?> TryRunAutomaticVerificationAsync(
         IReadOnlyCollection<string> mutatedPaths,
@@ -458,13 +508,47 @@ public class ConversationRuntime
             .Any(block => !block.IsError);
 
     private bool ShouldRunAutomaticVerification() =>
-        _autoVerifyMode switch
+        Mode == AgentExecutionMode.Planning
+            ? false
+            : _autoVerifyMode switch
         {
             AutoVerifyMode.Off => false,
             AutoVerifyMode.DangerOnly => _permissionMode == PermissionMode.DangerFullAccess,
             AutoVerifyMode.On => true,
             _ => false
         };
+
+    private IReadOnlyList<string> BuildRequestSystemPrompt()
+    {
+        if (Mode != AgentExecutionMode.Planning)
+        {
+            return _systemPrompt;
+        }
+
+        var modePrompt = BuildPlanningModePrompt();
+        return [.. _systemPrompt, modePrompt];
+    }
+
+    private string BuildPlanningModePrompt()
+    {
+        var depthNote = string.Equals(PlanningDepth, "deep", StringComparison.OrdinalIgnoreCase)
+            ? "Use a deeper planning pass: inspect more files, compare alternatives, and be explicit about tradeoffs."
+            : "Keep the plan crisp and executable, but still concrete.";
+
+        return $@"Planning Mode
+You are currently in planning mode. Do not make code changes, do not use mutating tools, and do not run shell commands.
+Use only read-only inspection tools such as read_file, glob_search, grep_search, find_symbol, find_references, and TaskCreate/TaskGet/TaskList with `subagent_type: ""Explore""` for broader repo analysis.
+Produce a structured plan with these sections:
+- Goal
+- Assumptions
+- Affected Areas
+- Steps
+- Risks
+- Validation
+- Open Questions
+End by clearly indicating that you are waiting for approval before implementation.
+{depthNote}";
+    }
 
     private bool ShouldPromptForAutomaticVerification() =>
         _permissionMode != PermissionMode.DangerFullAccess || _autoVerifyMode == AutoVerifyMode.On;

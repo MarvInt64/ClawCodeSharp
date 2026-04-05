@@ -50,7 +50,7 @@ public class PermissionPolicy
     
     public PermissionResult Authorize(string toolName, string input, IPermissionPrompter? prompter = null)
     {
-        var requiredMode = GetRequiredPermissionMode(toolName);
+        var requiredMode = RequiredPermissionFor(toolName);
         
         if (CanExecute(_mode, requiredMode))
         {
@@ -76,7 +76,7 @@ public class PermissionPolicy
         return PermissionResult.Denied($"Tool '{toolName}' requires {requiredMode.AsString()} permission");
     }
     
-    private PermissionMode GetRequiredPermissionMode(string toolName)
+    public PermissionMode RequiredPermissionFor(string toolName)
     {
         return _toolPermissions.TryGetValue(toolName, out var mode)
             ? mode

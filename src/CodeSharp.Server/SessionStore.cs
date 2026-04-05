@@ -174,10 +174,6 @@ public class SessionStore
                 }
             }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            yield break;
-        }
         finally
         {
             lock (_gate)

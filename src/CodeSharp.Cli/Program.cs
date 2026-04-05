@@ -946,6 +946,9 @@ Add any additional context about the project.
             "grep_search" => DescribeGrepSearchStart(payload),
             "find_symbol" => $"finding symbol {Quote(JsonString(payload, "symbol"))}",
             "find_references" => $"finding references to {Quote(JsonString(payload, "symbol"))}",
+            "TaskCreate" => DescribeTaskCreateStart(payload),
+            "TaskGet" => $"loading task {Quote(JsonString(payload, "task_id"))}",
+            "TaskList" => "listing tasks",
             "bash" => DescribeShellCommandStart(JsonString(payload, "command")),
             "PowerShell" => DescribeShellCommandStart(JsonString(payload, "command")),
             "WebFetch" => $"fetching {JsonString(payload, "url") ?? "url"}",
@@ -978,6 +981,9 @@ Add any additional context about the project.
             "auto_verify" => DescribeAutoVerifyFinish(payload, fallbackDescription, isError),
             "find_symbol" => DescribeSearchSummaryFinish(payload, fallbackDescription, "totalMatches"),
             "find_references" => DescribeSearchSummaryFinish(payload, fallbackDescription, "totalReferences"),
+            "TaskCreate" => DescribeTaskCreateFinish(payload, fallbackDescription, isError),
+            "TaskGet" => DescribeTaskGetFinish(payload, fallbackDescription, isError),
+            "TaskList" => DescribeTaskListFinish(payload, fallbackDescription, isError),
             "bash" => DescribeShellCommandFinish(payload, fallbackDescription, isError),
             "PowerShell" => DescribeShellCommandFinish(payload, fallbackDescription, isError),
             "TodoWrite" => isError ? "failed updating plan" : fallbackDescription,
@@ -1020,6 +1026,11 @@ Add any additional context about the project.
         if (toolName is "find_symbol" or "find_references")
         {
             return ExtractSearchPreviewLines(payload);
+        }
+
+        if (toolName is "TaskCreate" or "TaskGet" or "TaskList")
+        {
+            return ExtractTaskPreviewLines(toolName, payload);
         }
 
         if (toolName is "bash" or "PowerShell")
@@ -1169,6 +1180,64 @@ Add any additional context about the project.
         return count is null ? fallbackDescription : $"{fallbackDescription} ({count:N0})";
     }
 
+    private static string DescribeTaskCreateStart(JsonElement? payload)
+    {
+        var subagentType = JsonString(payload, "subagent_type");
+        var description = JsonString(payload, "description");
+        var path = DisplayPath(JsonString(payload, "path"));
+
+        if (string.Equals(subagentType, "Explore", StringComparison.OrdinalIgnoreCase))
+        {
+            return string.IsNullOrWhiteSpace(path)
+                ? $"exploring workspace for {Quote(description)}"
+                : $"exploring {path} for {Quote(description)}";
+        }
+
+        return string.IsNullOrWhiteSpace(subagentType)
+            ? "creating task"
+            : $"creating {subagentType} task";
+    }
+
+    private static string DescribeTaskCreateFinish(JsonElement? payload, string fallbackDescription, bool isError)
+    {
+        if (isError)
+        {
+            return fallbackDescription.StartsWith("exploring ", StringComparison.OrdinalIgnoreCase)
+                ? $"failed {fallbackDescription}"
+                : "failed creating task";
+        }
+
+        var subagentType = JsonString(payload, "subagentType");
+        var totalFiles = JsonInt(payload, "totalFiles");
+        if (string.Equals(subagentType, "Explore", StringComparison.OrdinalIgnoreCase))
+        {
+            return totalFiles is { } count
+                ? $"completed workspace explore ({count:N0} files)"
+                : "completed workspace explore";
+        }
+
+        return fallbackDescription;
+    }
+
+    private static string DescribeTaskListFinish(JsonElement? payload, string fallbackDescription, bool isError)
+    {
+        if (isError)
+        {
+            return "failed listing tasks";
+        }
+
+        var totalTasks = JsonInt(payload, "totalTasks");
+        return totalTasks is null ? fallbackDescription : $"listed tasks ({totalTasks:N0})";
+    }
+
+    private static string DescribeTaskGetFinish(JsonElement? payload, string fallbackDescription, bool isError)
+    {
+        var taskId = JsonString(payload, "taskId") ?? JsonString(payload, "task_id");
+        return isError
+            ? $"failed loading task {Quote(taskId)}"
+            : $"loaded task {Quote(taskId)}";
+    }
+
     private static IReadOnlyList<string>? ExtractSearchPreviewLines(JsonElement? payload)
     {
         if (payload is not { ValueKind: JsonValueKind.Object } json)
@@ -1195,6 +1264,140 @@ Add any additional context about the project.
         }
 
         return null;
+    }
+
+    private static IReadOnlyList<string>? ExtractTaskPreviewLines(string toolName, JsonElement? payload)
+    {
+        if (payload is not { ValueKind: JsonValueKind.Object } json)
+        {
+            return null;
+        }
+
+        if (toolName == "TaskList")
+        {
+            if (!json.TryGetProperty("tasks", out var tasks) || tasks.ValueKind != JsonValueKind.Array)
+            {
+                return null;
+            }
+
+            return tasks.EnumerateArray()
+                .Take(6)
+                .Select(FormatTaskListPreviewItem)
+                .Where(static line => !string.IsNullOrWhiteSpace(line))
+                .ToList();
+        }
+
+        var lines = new List<string>();
+        var summary = JsonString(payload, "summary");
+        if (!string.IsNullOrWhiteSpace(summary))
+        {
+            lines.Add(Truncate(summary, 160));
+        }
+
+        AppendTaskPreviewGroup(lines, payload, "languages", "Top languages", "language", "files", 4);
+        AppendTaskPreviewGroup(lines, payload, "directories", "Top directories", "directory", "files", 4);
+
+        if (json.TryGetProperty("suggestedFiles", out var suggestedFiles) && suggestedFiles.ValueKind == JsonValueKind.Array)
+        {
+            var fileList = suggestedFiles.EnumerateArray()
+                .Take(5)
+                .Select(item => JsonString(item, "file"))
+                .Where(static file => !string.IsNullOrWhiteSpace(file))
+                .Cast<string>()
+                .ToList();
+
+            if (fileList.Count > 0)
+            {
+                lines.Add("Suggested files: " + string.Join(", ", fileList));
+            }
+        }
+
+        if (json.TryGetProperty("keywordHits", out var keywordHits) && keywordHits.ValueKind == JsonValueKind.Array)
+        {
+            var hitList = keywordHits.EnumerateArray()
+                .Take(4)
+                .Select(item =>
+                {
+                    var keyword = JsonString(item, "keyword");
+                    var file = JsonString(item, "file");
+                    var line = JsonInt(item, "line");
+                    if (string.IsNullOrWhiteSpace(keyword) || string.IsNullOrWhiteSpace(file))
+                    {
+                        return null;
+                    }
+
+                    return line is > 0
+                        ? $"{keyword} -> {file}:{line}"
+                        : $"{keyword} -> {file}";
+                })
+                .Where(static value => !string.IsNullOrWhiteSpace(value))
+                .Cast<string>()
+                .ToList();
+
+            if (hitList.Count > 0)
+            {
+                lines.Add("Keyword hits: " + string.Join(", ", hitList));
+            }
+        }
+
+        return lines.Count == 0 ? null : lines;
+    }
+
+    private static string FormatTaskListPreviewItem(JsonElement item)
+    {
+        if (item.ValueKind != JsonValueKind.Object)
+        {
+            return string.Empty;
+        }
+
+        var taskId = JsonString(item, "taskId") ?? JsonString(item, "TaskId");
+        var subagentType = JsonString(item, "subagentType") ?? JsonString(item, "SubagentType");
+        var description = JsonString(item, "description") ?? JsonString(item, "Description");
+        var status = JsonString(item, "status") ?? JsonString(item, "Status");
+
+        var prefix = string.IsNullOrWhiteSpace(subagentType) ? "task" : subagentType;
+        var suffix = string.IsNullOrWhiteSpace(status) ? string.Empty : $" [{status}]";
+        if (!string.IsNullOrWhiteSpace(description))
+        {
+            return $"{prefix} {taskId}{suffix} · {Truncate(description, 96)}";
+        }
+
+        return $"{prefix} {taskId}{suffix}";
+    }
+
+    private static void AppendTaskPreviewGroup(
+        List<string> lines,
+        JsonElement? payload,
+        string propertyName,
+        string label,
+        string nameProperty,
+        string countProperty,
+        int limit
+    )
+    {
+        if (payload is not { ValueKind: JsonValueKind.Object } json ||
+            !json.TryGetProperty(propertyName, out var items) ||
+            items.ValueKind != JsonValueKind.Array)
+        {
+            return;
+        }
+
+        var formatted = items.EnumerateArray()
+            .Take(limit)
+            .Select(item =>
+            {
+                var name = JsonString(item, nameProperty);
+                var count = JsonInt(item, countProperty);
+                return string.IsNullOrWhiteSpace(name) || count is null ? null : $"{name} ({count.Value:N0})";
+            })
+            .Where(static value => !string.IsNullOrWhiteSpace(value))
+            .Cast<string>()
+            .ToList();
+
+        if (formatted.Count > 0)
+        {
+            lines.Add($"{label}: {string.Join(", ", formatted)}");
+        }
     }
 
     private static string FormatSearchPreviewItem(JsonElement item)
@@ -1885,7 +2088,37 @@ Add any additional context about the project.
             options.PermissionMode,
             globalSettings.GetAutoVerifyMode()
         );
-        
+
+        toolExecutor.AgentRunner = async (description, prompt, subagentType, ct) =>
+        {
+            var agentSystemPrompt = BuildAgentSystemPrompt(subagentType, cwd, DateTime.UtcNow.ToString("yyyy-MM-dd"));
+            var agentSession = new Session();
+            var agentMode = string.Equals(subagentType, "Plan", StringComparison.OrdinalIgnoreCase)
+                ? AutoVerifyMode.Off
+                : globalSettings.GetAutoVerifyMode();
+            var agentRuntime = new ConversationRuntime(
+                agentSession,
+                apiClient,
+                toolExecutor,
+                permissionPolicy,
+                agentSystemPrompt,
+                options.PermissionMode,
+                agentMode,
+                maxIterations: 20
+            );
+            if (string.Equals(subagentType, "Plan", StringComparison.OrdinalIgnoreCase))
+            {
+                agentRuntime.Mode = AgentExecutionMode.Planning;
+            }
+
+            var agentPromptText = $"[Agent task: {description}]\n\n{prompt}";
+            var summary = await agentRuntime.RunTurnAsync(agentPromptText, cancellationToken: ct);
+            return string.Join("\n\n", summary.AssistantMessages
+                .SelectMany(m => m.Blocks.OfType<ContentBlock.Text>())
+                .Select(b => b.Content.Trim())
+                .Where(s => !string.IsNullOrWhiteSpace(s)));
+        };
+
         return (runtime, registry, toolExecutor, apiClient);
     }
 
@@ -1917,17 +2150,31 @@ Add any additional context about the project.
 
         var prompt = new List<string>
         {
-            "You are CodeSharp, an AI-powered code assistant.",
+            "You are CodeSharp, an AI-powered code assistant built to help with software engineering tasks in the terminal.",
             $@"Environment
 Date: {date}
 Working Directory: {cwd}
-Permission Mode: {permissionMode.AsString()}",
-            $@"Available tools and constraints
+Permission Mode: {permissionMode.AsString()}
+Platform: {(OperatingSystem.IsWindows() ? "windows" : OperatingSystem.IsMacOS() ? "macos" : "linux")}",
+            $@"Available tools
 {string.Join("\n", toolLines)}
 
-Respect the tool surface exactly. Do not invent unavailable tools. Prefer read-only tools for analysis before using mutating tools. For write operations, make focused edits and avoid unrelated changes.",
+Respect the tool surface exactly — do not invent unavailable tools. Prefer read-only tools for analysis before using mutating tools. For write operations, make focused edits and avoid unrelated changes.",
+            @"Doing tasks
+The user will primarily ask you to perform software engineering tasks: fix bugs, add features, refactor code, explain code, and more.
+
+- In general, do not propose changes to code you haven't read. Read it first.
+- Do not add features, refactor code, or make improvements beyond what was explicitly asked. A bug fix does not need surrounding code cleaned up. A simple feature does not need extra configurability.
+- Do not add docstrings, comments, or type annotations to code you did not change. Only add comments where logic is non-obvious.
+- Do not add error handling or validation for scenarios that cannot happen. Trust internal guarantees. Only validate at system boundaries (user input, external APIs).
+- Do not use feature flags or backwards-compatibility shims — just change the code.
+- Do not create helpers, utilities, or abstractions for one-time operations. Three similar lines of code is better than a premature abstraction.
+- Do not design for hypothetical future requirements. The minimum complexity needed for the current task is correct.
+- Be careful not to introduce security vulnerabilities: no command injection, XSS, SQL injection, path traversal, or other OWASP top-10 issues. Validate untrusted input at boundaries.
+- If you notice you wrote insecure code, fix it immediately before continuing.",
             @"Tool usage guidance
 - Before using tools, say in one concise sentence what you are about to inspect, search, or change.
+- For broad repository analysis or unfamiliar codebases, prefer `TaskCreate` with `subagent_type: ""Explore""` before jumping into many grep_search/read_file calls. Use the returned summary, suggested files, and keyword hits to decide where to read next.
 - Use `find_symbol` when you know a likely identifier name and want declaration candidates across supported languages before falling back to broader regex search.
 - Use `find_references` after locating a declaration to inspect likely impact before editing across the workspace.
 - For repository exploration, start with grep_search or glob_search before calling read_file on many files.
@@ -1944,25 +2191,42 @@ Respect the tool surface exactly. Do not invent unavailable tools. Prefer read-o
 - After successful file edits, CodeSharp may run an automatic verification command in the background and feed you a compact system note with the result. Use that result instead of immediately re-running the same build command yourself unless you need a narrower follow-up check.
 - Do not use `bash`, `PowerShell`, `head`, `tail`, `od`, `Get-Content`, or similar shell probes to inspect file contents when `read_file` can do it directly.
 - Shell-based file inspection of workspace files may be rejected; use `read_file` instead.",
+            @"Planning mode
+You have access to `EnterPlanMode` and `ExitPlanMode` tools to control your execution mode.
+- Use `EnterPlanMode` when you need to analyze a complex problem before making changes, or when the task would benefit from user review before execution.
+- In planning mode all mutating tools (write_file, edit_file, bash, etc.) are blocked — use only read-only inspection tools.
+- Produce a structured plan with: Goal, Assumptions, Affected Areas, Steps, Risks, Validation, Open Questions.
+- Use `ExitPlanMode` (or wait for the user's /plan approve) when ready to implement.
+- Do NOT automatically enter planning mode for simple, clear tasks. Reserve it for complex multi-file changes or when explicitly asked.",
             @"Whole-project analysis
 - When asked to review, analyze, or improve 'the project' or 'the codebase' broadly, do NOT dive deep into a single file. Instead, follow this order:
-  1. Run glob_search('src/**/*.cs') (or the appropriate pattern) to enumerate all source files.
-  2. Skim 4-8 representative files spread across different layers (entry points, core logic, data access, UI/CLI, tests) using small read_file slices (limit 40-80 lines each).
-  3. Only after that broad scan, give a balanced assessment that references multiple files and layers — not just whichever file happened to be largest or first.
+  1. Run `TaskCreate` with `subagent_type: ""Explore""` to get a structured workspace summary and representative file suggestions.
+  2. Use glob_search/find_symbol/find_references to narrow to the most relevant areas from that summary.
+  3. Skim 4-8 representative files spread across different layers (entry points, core logic, data access, UI/CLI, tests) using small read_file slices (limit 40-80 lines each).
+  4. Only after that broad scan, give a balanced assessment that references multiple files and layers — not just whichever file happened to be largest or first.
 - A good broad review mentions: entry points, domain/business logic, infrastructure, error handling, tests, CI/CD, and security — spread across the actual files found.
 - Do not let one large file dominate a broad analysis simply because it is large.",
+            @"Git workflow
+When the user asks you to commit, push, or create a PR:
+- Use conventional commit format: `type(scope): description` — e.g. `fix(auth): handle expired tokens` or `feat(cli): add /branch command`.
+- Keep the subject line under 72 characters. Add a blank line and a short body if the change needs context.
+- Only commit files that are part of the current task. Never commit unrelated staged files, .env files, or secrets.
+- For PRs: generate a title (under 70 chars) and a body with Summary, Test plan, and any breaking changes.
+- Use the /commit slash command for git commits, /diff to preview changes, /pr to open a pull request.
+- Never force-push to main/master. Never use --no-verify unless explicitly asked.",
             @"Search and verification rules
 - Do not claim that something is absent from the codebase unless the relevant search result actually returned zero matches.
 - For broad repo questions, prefer at least one broad search and one targeted follow-up search before concluding nothing was found.
 - When reporting search results, mention what patterns you searched for and whether the result was truncated or sampled.
 - If search finds matches, summarize the concrete files or categories instead of answering as if nothing was found.",
-            @"Output style guidelines
-- Be concise, direct, and technically precise.
-- Prefer actionable answers over long preambles.
-- Use Markdown when it improves readability.
-- Use fenced code blocks with a language tag for code.
-- Summarize findings clearly after inspection instead of dumping raw tool output.
-- When giving file-specific feedback, mention the file and the concrete issue or recommendation.",
+            @"Output style
+- Go straight to the point. Lead with the answer or action, not the reasoning. Skip filler words, preamble, and unnecessary transitions.
+- Do not restate what the user said — just do it.
+- Keep responses short and direct. If you can say it in one sentence, don't use three.
+- Use Markdown when it improves readability. Use fenced code blocks with a language tag for code.
+- Do not use emojis unless the user explicitly asks.
+- When referencing specific functions or code, use the pattern `file_path:line_number`.
+- Summarize findings clearly after inspection instead of dumping raw tool output.",
             @"Error-handling behavior
 - If a tool fails, report the failure briefly and include the relevant reason.
 - If another safe tool can recover the missing context, try that before giving up.
@@ -1977,6 +2241,32 @@ Respect the tool surface exactly. Do not invent unavailable tools. Prefer read-o
         }
 
         return prompt;
+    }
+
+    private static IReadOnlyList<string> BuildAgentSystemPrompt(string? subagentType, string cwd, string date)
+    {
+        var intro = subagentType?.ToLowerInvariant() switch
+        {
+            "explore" =>
+                "You are a specialized Explore agent. Your sole job is to analyze a workspace and produce a structured, factual summary. " +
+                "Use only read-only tools: read_file, glob_search, grep_search, find_symbol, find_references. " +
+                "Do not make any changes. Return a clear summary of what you found.",
+            "plan" =>
+                "You are a specialized Plan agent. Your job is to analyze the workspace and produce a concrete, structured implementation plan. " +
+                "Use read-only inspection tools only. Produce a plan with: Goal, Assumptions, Affected Areas, Steps, Risks, Validation, Open Questions. " +
+                "Do not make any changes.",
+            _ =>
+                "You are a specialized sub-agent spawned to handle a focused task autonomously. " +
+                "Complete the task described in the prompt and return a clear result. " +
+                "Use the minimum set of tools needed."
+        };
+
+        return
+        [
+            intro,
+            $"Environment\nDate: {date}\nWorking Directory: {cwd}",
+            "Keep your response focused and concise. Lead with findings, not preamble. Do not add features or changes beyond the task scope."
+        ];
     }
 
     private static bool IsModelVisibleTool(string toolName)
@@ -1996,20 +2286,34 @@ Respect the tool surface exactly. Do not invent unavailable tools. Prefer read-o
 
     private static string? ReadProjectInstructions(string cwd)
     {
-        var path = Path.Combine(cwd, "CODESHARP.md");
-        if (!File.Exists(path))
+        var parts = new List<string>();
+
+        TryAppendFileContent(parts, Path.Combine(cwd, "CODESHARP.md"), "Project instructions");
+        TryAppendFileContent(parts, Path.Combine(cwd, ".codesharp", "MEMORY.md"), "Project memory index");
+
+        var memoryDir = Path.Combine(cwd, ".codesharp", "memory");
+        if (Directory.Exists(memoryDir))
         {
-            return null;
+            foreach (var memFile in Directory.EnumerateFiles(memoryDir, "*.md").OrderBy(f => f))
+            {
+                TryAppendFileContent(parts, memFile, null);
+            }
         }
 
+        return parts.Count == 0 ? null : string.Join("\n\n", parts);
+    }
+
+    private static void TryAppendFileContent(List<string> parts, string path, string? header)
+    {
+        if (!File.Exists(path)) return;
         try
         {
             var content = File.ReadAllText(path).Trim();
-            return string.IsNullOrWhiteSpace(content) ? null : content;
+            if (!string.IsNullOrWhiteSpace(content))
+            {
+                parts.Add(header is not null ? $"{header}\n{content}" : content);
+            }
         }
-        catch
-        {
-            return null;
-        }
+        catch { }
     }
 }

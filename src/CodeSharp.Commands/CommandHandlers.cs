@@ -10,7 +10,7 @@ public static class CommandHandlers
         var lines = new List<string>
         {
             "Help",
-            "  Slash commands   Type /help, /config, /status, /cost, /model, /permissions, /export",
+            "  Slash commands   Type /help, /plan, /config, /status, /cost, /model, /permissions, /export",
             "  Exit             /exit or /quit",
             "",
             "Commands"
@@ -36,6 +36,7 @@ public static class CommandHandlers
     
     public static string RenderStatus(
         string model,
+        AgentExecutionMode executionMode,
         PermissionMode mode,
         int messageCount,
         int turns,
@@ -47,6 +48,7 @@ public static class CommandHandlers
         {
             "Status",
             $"  Model            {model}",
+            $"  Mode             {executionMode.AsString()}",
             $"  Permissions      {mode.AsString()}",
             $"  Activity         {messageCount} messages · {turns} turns",
             $"  Tokens           {totalTokens:N0}"

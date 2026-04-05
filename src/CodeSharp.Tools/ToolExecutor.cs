@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
@@ -14,10 +15,19 @@ public class ToolExecutor : IToolExecutor
     private const int MaxShellOutputChars = 12_000;
     private const int ShellOutputHeadChars = 9_000;
     private const int ShellOutputTailChars = 2_000;
+    private const int MaxExploreFiles = 4_000;
 
     private readonly GlobalToolRegistry _registry;
     private readonly string _workingDirectory;
     private readonly GitIgnoreMatcher _gitIgnoreMatcher;
+    private readonly ConcurrentDictionary<string, ExploreTaskRecord> _tasks = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Optional agent execution delegate. When set, the Agent tool spawns an isolated
+    /// conversation that runs the given prompt and returns its final text output.
+    /// Signature: (description, prompt, subagentType, cancellationToken) → result text.
+    /// </summary>
+    public Func<string, string, string?, CancellationToken, Task<string>>? AgentRunner { get; set; }
 
     public ToolExecutor(GlobalToolRegistry registry, string? workingDirectory = null)
     {
@@ -56,7 +66,10 @@ public class ToolExecutor : IToolExecutor
             "WebSearch" => await ExecuteWebSearchAsync(input, cancellationToken),
             "TodoWrite" => ExecuteTodoWrite(input),
             "Skill" => ExecuteSkill(input),
-            "Agent" => ExecuteAgent(input),
+            "Agent" => await ExecuteAgentAsync(input, cancellationToken),
+            "TaskCreate" => ExecuteTaskCreate(input),
+            "TaskGet" => ExecuteTaskGet(input),
+            "TaskList" => ExecuteTaskList(),
             "ToolSearch" => ExecuteToolSearch(input),
             "NotebookEdit" => ExecuteNotebookEdit(input),
             "Sleep" => ExecuteSleep(input),
@@ -65,6 +78,8 @@ public class ToolExecutor : IToolExecutor
             "StructuredOutput" => ExecuteStructuredOutput(input),
             "REPL" => await ExecuteReplAsync(input, cancellationToken),
             "PowerShell" => await ExecutePowerShellAsync(input, cancellationToken),
+            "EnterPlanMode" => JsonSerializer.Serialize(new { switched = true, mode = "planning" }),
+            "ExitPlanMode" => JsonSerializer.Serialize(new { switched = true, mode = "execute" }),
             _ => throw new ArgumentException($"Unsupported tool: {toolName}")
         };
     }
@@ -710,16 +725,87 @@ public class ToolExecutor : IToolExecutor
         return JsonSerializer.Serialize(new { skill, args, status = "Skill loading not fully implemented" });
     }
     
-    private string ExecuteAgent(JsonElement input)
+    private async Task<string> ExecuteAgentAsync(JsonElement input, CancellationToken cancellationToken)
     {
         var description = input.GetProperty("description").GetString() ?? string.Empty;
         var prompt = input.GetProperty("prompt").GetString() ?? string.Empty;
-        
+        var subagentType = input.TryGetProperty("subagent_type", out var sat) ? sat.GetString() : null;
+        var agentId = Guid.NewGuid().ToString("N")[..12];
+
+        if (AgentRunner is null)
+        {
+            return JsonSerializer.Serialize(new
+            {
+                agentId,
+                description,
+                subagentType,
+                status = "Agent runner not configured — set AgentRunner on ToolExecutor to enable agent execution."
+            });
+        }
+
+        var result = await AgentRunner(description, prompt, subagentType, cancellationToken);
         return JsonSerializer.Serialize(new
         {
-            agentId = Guid.NewGuid().ToString(),
+            agentId,
             description,
-            status = "Agent execution not fully implemented"
+            subagentType,
+            result
+        });
+    }
+
+    private string ExecuteTaskCreate(JsonElement input)
+    {
+        var description = input.GetProperty("description").GetString() ?? string.Empty;
+        var prompt = input.GetProperty("prompt").GetString() ?? string.Empty;
+        var subagentType = input.GetProperty("subagent_type").GetString() ?? string.Empty;
+        var basePath = input.TryGetProperty("path", out var pathEl)
+            ? pathEl.GetString() ?? _workingDirectory
+            : _workingDirectory;
+
+        if (!string.Equals(subagentType, "Explore", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("TaskCreate currently supports only `subagent_type: \"Explore\"`.");
+        }
+
+        var fullPath = Path.GetFullPath(basePath, _workingDirectory);
+        var files = EnumerateExploreFiles(fullPath)
+            .Take(MaxExploreFiles)
+            .ToList();
+
+        var taskId = $"task_{Guid.NewGuid():N}";
+        var record = WorkspaceExplore.Analyze(taskId, ResolveSearchRoot(fullPath), description, prompt, files);
+        _tasks[taskId] = record;
+
+        return JsonSerializer.Serialize(BuildTaskPayload(record));
+    }
+
+    private string ExecuteTaskGet(JsonElement input)
+    {
+        var taskId = input.GetProperty("task_id").GetString() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(taskId))
+        {
+            throw new InvalidOperationException("TaskGet requires a non-empty `task_id`.");
+        }
+
+        if (!_tasks.TryGetValue(taskId, out var record))
+        {
+            throw new InvalidOperationException($"Task `{taskId}` was not found in this session.");
+        }
+
+        return JsonSerializer.Serialize(BuildTaskPayload(record));
+    }
+
+    private string ExecuteTaskList()
+    {
+        var tasks = _tasks.Values
+            .OrderByDescending(task => task.CreatedAtUtc, StringComparer.Ordinal)
+            .Select(BuildTaskListItem)
+            .ToList();
+
+        return JsonSerializer.Serialize(new
+        {
+            totalTasks = tasks.Count,
+            tasks
         });
     }
     
@@ -730,6 +816,87 @@ public class ToolExecutor : IToolExecutor
         
         return JsonSerializer.Serialize(new { query, matches = Array.Empty<string>() });
     }
+
+    private IEnumerable<string> EnumerateExploreFiles(string path)
+    {
+        if (File.Exists(path))
+        {
+            if (IsExploreCandidateFile(path) && !ShouldIgnoreSearchFile(path))
+            {
+                yield return path;
+            }
+
+            yield break;
+        }
+
+        foreach (var file in EnumerateSearchFiles(path))
+        {
+            if (IsExploreCandidateFile(file))
+            {
+                yield return file;
+            }
+        }
+    }
+
+    private static bool IsExploreCandidateFile(string file)
+    {
+        var name = Path.GetFileName(file);
+        var extension = Path.GetExtension(file).ToLowerInvariant();
+
+        return WorkspaceSymbolSearch.IsSupportedSourceFile(file) ||
+               extension is ".csproj" or ".sln" or ".props" or ".targets" or
+                   ".json" or ".yml" or ".yaml" or ".toml" or ".xml" or
+                   ".md" or ".txt" or ".sh" or ".ps1" or ".sql" or ".css" or ".scss" ||
+               name.Equals("Dockerfile", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("Makefile", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("README", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("README.md", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static object BuildTaskPayload(ExploreTaskRecord task) => new
+    {
+        taskId = task.TaskId,
+        description = task.Description,
+        prompt = task.Prompt,
+        subagentType = task.SubagentType,
+        status = task.Status,
+        totalFiles = task.TotalFiles,
+        summary = task.Summary,
+        languages = task.Languages.Select(language => new
+        {
+            language = language.Language,
+            files = language.Files
+        }),
+        directories = task.Directories.Select(directory => new
+        {
+            directory = directory.Directory,
+            files = directory.Files
+        }),
+        suggestedFiles = task.SuggestedFiles.Select(file => new
+        {
+            file = file.File,
+            reason = file.Reason
+        }),
+        keywordHits = task.KeywordHits.Select(hit => new
+        {
+            keyword = hit.Keyword,
+            file = hit.File,
+            line = hit.Line,
+            context = hit.Context
+        }),
+        createdAtUtc = task.CreatedAtUtc
+    };
+
+    private static object BuildTaskListItem(ExploreTaskRecord task) => new
+    {
+        taskId = task.TaskId,
+        description = task.Description,
+        subagentType = task.SubagentType,
+        status = task.Status,
+        totalFiles = task.TotalFiles,
+        createdAtUtc = task.CreatedAtUtc,
+        summary = task.Summary
+    };
     
     private string ExecuteNotebookEdit(JsonElement input)
     {

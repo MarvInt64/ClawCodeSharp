@@ -368,6 +368,44 @@ public class GlobalToolRegistry
             },
             PermissionMode.DangerFullAccess
         ),
+        new("TaskCreate", "Create a read-only task. Use `subagent_type: \"Explore\"` to analyze a broad area of the workspace and get a structured summary before deeper reads.",
+            new
+            {
+                type = "object",
+                properties = new
+                {
+                    description = new { type = "string" },
+                    prompt = new { type = "string" },
+                    subagent_type = new { type = "string" },
+                    path = new { type = "string" }
+                },
+                required = new[] { "description", "prompt", "subagent_type" },
+                additionalProperties = false
+            },
+            PermissionMode.ReadOnly
+        ),
+        new("TaskGet", "Fetch the result of a previously created read-only task.",
+            new
+            {
+                type = "object",
+                properties = new
+                {
+                    task_id = new { type = "string" }
+                },
+                required = new[] { "task_id" },
+                additionalProperties = false
+            },
+            PermissionMode.ReadOnly
+        ),
+        new("TaskList", "List read-only tasks created in the current session.",
+            new
+            {
+                type = "object",
+                properties = new { },
+                additionalProperties = false
+            },
+            PermissionMode.ReadOnly
+        ),
         new("ToolSearch", "Search for deferred or specialized tools by exact name or keywords.",
             new
             {
@@ -480,6 +518,32 @@ public class GlobalToolRegistry
                 additionalProperties = false
             },
             PermissionMode.DangerFullAccess
+        ),
+        new("EnterPlanMode", "Switch to planning mode. In planning mode all mutating tools are blocked. Use this when you need to analyze a problem before proposing changes, or when the user should review and approve a plan before execution.",
+            new
+            {
+                type = "object",
+                properties = new
+                {
+                    reason = new { type = "string" }
+                },
+                required = new[] { "reason" },
+                additionalProperties = false
+            },
+            PermissionMode.ReadOnly
+        ),
+        new("ExitPlanMode", "Exit planning mode and return to execute mode. Use this after the user has approved a plan and you are ready to implement it.",
+            new
+            {
+                type = "object",
+                properties = new
+                {
+                    reason = new { type = "string" }
+                },
+                required = new[] { "reason" },
+                additionalProperties = false
+            },
+            PermissionMode.ReadOnly
         ),
     ];
 }

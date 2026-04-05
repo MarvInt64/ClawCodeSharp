@@ -60,6 +60,7 @@ public class CommandRegistry
         new("symbols", ["symbol", "sym"], "Find symbol declarations in the workspace", true),
         new("refs", ["references"], "Find symbol references in the workspace", true),
         new("version", ["v"], "Show version", true),
+        new("plan", [], "Switch planning mode on/off or approve a plan", true),
         new("agents", [], "List available agents", true, ShowInRepl: false),
         new("skills", [], "List available skills", true, ShowInRepl: false),
         new("plugins", [], "Manage plugins", ShowInRepl: false),

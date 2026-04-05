@@ -7,6 +7,7 @@ using CodeSharp.Core;
 using CodeSharp.Server;
 using CodeSharp.Tools;
 using Xunit;
+using ApiToolDefinition = CodeSharp.Api.ToolDefinition;
 
 namespace CodeSharp.Tests;
 
@@ -76,7 +77,7 @@ public class ContextAndProtocolTests
             ],
             Tools:
             [
-                new ToolDefinition("grep_search", "Search the repo", new { type = "object" })
+                new ApiToolDefinition("grep_search", "Search the repo", new { type = "object" })
             ],
             SystemPrompt: "You are CodeSharp."
         );
@@ -198,6 +199,75 @@ function loadClient(client: ApiClient) {
     }
 
     [Fact]
+    public async Task TaskCreate_Explore_ReturnsWorkspaceSummaryAndSuggestedFiles()
+    {
+        var workspace = Path.Combine(Path.GetTempPath(), $"codesharp-tests-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workspace);
+        Directory.CreateDirectory(Path.Combine(workspace, "src"));
+        Directory.CreateDirectory(Path.Combine(workspace, "tests"));
+
+        await File.WriteAllTextAsync(Path.Combine(workspace, "src", "Program.cs"), """
+using Demo;
+
+Console.WriteLine("hello");
+""");
+
+        await File.WriteAllTextAsync(Path.Combine(workspace, "src", "ApiClient.ts"), """
+export class ApiClient {
+  fetchUser() {
+    return null;
+  }
+}
+""");
+
+        await File.WriteAllTextAsync(Path.Combine(workspace, "README.md"), """
+# Demo
+
+This repository contains an api client and entry point.
+""");
+
+        var executor = new ToolExecutor(new GlobalToolRegistry(), workspace);
+        var result = await executor.ExecuteAsync(
+            "TaskCreate",
+            """{"description":"understand the project layout","prompt":"analyze api client entry points","subagent_type":"Explore"}""");
+
+        using var document = JsonDocument.Parse(result.Output);
+        Assert.Equal("Explore", document.RootElement.GetProperty("subagentType").GetString());
+        Assert.Equal("completed", document.RootElement.GetProperty("status").GetString());
+        Assert.True(document.RootElement.GetProperty("totalFiles").GetInt32() >= 3);
+        Assert.Contains("Workspace scan covered", document.RootElement.GetProperty("summary").GetString(), StringComparison.Ordinal);
+        Assert.True(document.RootElement.GetProperty("languages").GetArrayLength() > 0);
+        Assert.True(document.RootElement.GetProperty("suggestedFiles").GetArrayLength() > 0);
+    }
+
+    [Fact]
+    public async Task TaskList_And_TaskGet_ReturnStoredExploreTasks()
+    {
+        var workspace = Path.Combine(Path.GetTempPath(), $"codesharp-tests-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workspace);
+        await File.WriteAllTextAsync(Path.Combine(workspace, "Program.cs"), "class Program {}");
+
+        var executor = new ToolExecutor(new GlobalToolRegistry(), workspace);
+        var created = await executor.ExecuteAsync(
+            "TaskCreate",
+            """{"description":"map the workspace","prompt":"look for entry points","subagent_type":"Explore"}""");
+
+        using var createdDoc = JsonDocument.Parse(created.Output);
+        var taskId = createdDoc.RootElement.GetProperty("taskId").GetString();
+        Assert.False(string.IsNullOrWhiteSpace(taskId));
+
+        var list = await executor.ExecuteAsync("TaskList", """{}""");
+        using var listDoc = JsonDocument.Parse(list.Output);
+        Assert.Equal(1, listDoc.RootElement.GetProperty("totalTasks").GetInt32());
+        Assert.Equal(taskId, listDoc.RootElement.GetProperty("tasks")[0].GetProperty("taskId").GetString());
+
+        var fetched = await executor.ExecuteAsync("TaskGet", $$"""{"task_id":"{{taskId}}"}""");
+        using var fetchedDoc = JsonDocument.Parse(fetched.Output);
+        Assert.Equal(taskId, fetchedDoc.RootElement.GetProperty("taskId").GetString());
+        Assert.Equal("Explore", fetchedDoc.RootElement.GetProperty("subagentType").GetString());
+    }
+
+    [Fact]
     public void SlashCommand_Parse_SupportsSymbolsAndReferences()
     {
         var symbols = SlashCommand.Parse("/symbols ApiClient");
@@ -209,6 +279,11 @@ function loadClient(client: ApiClient) {
         Assert.NotNull(refs);
         Assert.Equal(SlashCommandKind.References, refs!.Kind);
         Assert.Equal("ApiClient", refs.Args);
+
+        var plan = SlashCommand.Parse("/plan approve");
+        Assert.NotNull(plan);
+        Assert.Equal(SlashCommandKind.Plan, plan!.Kind);
+        Assert.Equal("approve", plan.Args);
     }
 
     [Fact]
@@ -309,7 +384,7 @@ version = "0.1.0"
             Directory.SetCurrentDirectory(workspace);
 
             var api = new FakeApiClient(
-                new[]
+                new AssistantEvent[][]
                 {
                     new AssistantEvent[]
                     {
@@ -317,12 +392,12 @@ version = "0.1.0"
                         new AssistantEvent.ToolUse("tool-1", "write_file", """{"path":"Program.cs","content":"class Program {}"}"""),
                         new AssistantEvent.MessageStop()
                     },
-                    new[]
+                    new AssistantEvent[]
                     {
                         new AssistantEvent.TextDelta("The edit is done."),
                         new AssistantEvent.MessageStop()
                     },
-                    new[]
+                    new AssistantEvent[]
                     {
                         new AssistantEvent.TextDelta("Verification passed."),
                         new AssistantEvent.MessageStop()
@@ -359,6 +434,59 @@ version = "0.1.0"
         {
             Directory.SetCurrentDirectory(originalCwd);
         }
+    }
+
+    [Fact]
+    public async Task RunTurnAsync_InPlanningMode_BlocksMutatingToolsAndAddsPlanningPrompt()
+    {
+        var api = new FakeApiClient(
+            new[]
+            {
+                new AssistantEvent[]
+                {
+                    new AssistantEvent.TextDelta("I will edit the file."),
+                    new AssistantEvent.ToolUse("tool-1", "write_file", """{"path":"Program.cs","content":"class Program {}"}"""),
+                    new AssistantEvent.MessageStop()
+                },
+                new AssistantEvent[]
+                {
+                    new AssistantEvent.TextDelta("Goal\n- Outline the change\n\nWaiting for approval."),
+                    new AssistantEvent.MessageStop()
+                }
+            });
+
+        var tools = new FakeToolExecutor();
+        var runtime = new ConversationRuntime(
+            Session.New(),
+            api,
+            tools,
+            new PermissionPolicy(
+                PermissionMode.DangerFullAccess,
+                new Dictionary<string, PermissionMode>
+                {
+                    ["write_file"] = PermissionMode.WorkspaceWrite
+                }),
+            ["You are CodeSharp."],
+            PermissionMode.DangerFullAccess,
+            AutoVerifyMode.On
+        )
+        {
+            Mode = AgentExecutionMode.Planning,
+            PlanningDepth = "deep"
+        };
+
+        var summary = await runtime.RunTurnAsync("plan this change");
+
+        Assert.Equal(2, api.Requests.Count);
+        Assert.Empty(tools.ExecutedTools);
+        Assert.Contains("Planning Mode", api.Requests[0].SystemPrompt.Last(), StringComparison.Ordinal);
+        Assert.Contains("TaskCreate/TaskGet/TaskList", api.Requests[0].SystemPrompt.Last(), StringComparison.Ordinal);
+        Assert.Contains("deeper planning pass", api.Requests[0].SystemPrompt.Last(), StringComparison.Ordinal);
+        Assert.Single(summary.ToolResults);
+        Assert.Contains(
+            "Planning mode blocks `write_file`",
+            summary.ToolResults[0].Blocks.OfType<ContentBlock.ToolResult>().Single().Output,
+            StringComparison.Ordinal);
     }
 
     [Fact]

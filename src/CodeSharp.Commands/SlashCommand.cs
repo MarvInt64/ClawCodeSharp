@@ -28,6 +28,7 @@ public enum SlashCommandKind
     Pr,
     Issue,
     CommitPushPr,
+    Plan,
     Ultraplan,
     Teleport,
     DebugToolCall,
@@ -118,6 +119,12 @@ public record SlashCommand
         Kind = SlashCommandKind.Plugins,
         Args = args
     };
+
+    public static SlashCommand Plan(string? args = null) => new()
+    {
+        Kind = SlashCommandKind.Plan,
+        Args = args
+    };
     
     public static SlashCommand Unknown(string name) => new()
     {
@@ -172,6 +179,7 @@ public record SlashCommand
             "pr" => new SlashCommand { Kind = SlashCommandKind.Pr, Args = args },
             "issue" => new SlashCommand { Kind = SlashCommandKind.Issue, Args = args },
             "commit-push-pr" or "cpp" => new SlashCommand { Kind = SlashCommandKind.CommitPushPr },
+            "plan" => Plan(args),
             "ultraplan" => new SlashCommand { Kind = SlashCommandKind.Ultraplan, Args = args },
             "teleport" => new SlashCommand { Kind = SlashCommandKind.Teleport, Args = args },
             "debug-tool-call" => new SlashCommand { Kind = SlashCommandKind.DebugToolCall },

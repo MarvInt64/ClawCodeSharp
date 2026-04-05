@@ -50,6 +50,7 @@ public class ReplSession
 
     public ConversationRuntime Runtime => _runtime;
     public string Model => _model;
+    public AgentExecutionMode ExecutionMode => _runtime.Mode;
     public PermissionMode PermissionMode => _permissionMode;
     public UsageTracker Usage => _usageTracker;
     public string SessionPath => _sessionPath;
@@ -69,10 +70,11 @@ public class ReplSession
                 ("Directory", cwd),
                 ("Model", _model),
                 ("Provider", _provider),
+                ("Mode", _runtime.Mode.AsString()),
                 ("Permissions", _permissionMode.AsString()),
                 ("Session", Path.GetFileNameWithoutExtension(_sessionPath))
             ],
-            "/help · /config · /status · type while thinking to queue · ESC cancels · Ctrl+C quits"
+            "/help · /plan · /config · /status · type while thinking to queue · ESC cancels · Ctrl+C quits"
         );
     }
 
@@ -87,6 +89,7 @@ public class ReplSession
             case SlashCommandKind.Status:
                 Console.WriteLine(CommandHandlers.RenderStatus(
                     _model,
+                    _runtime.Mode,
                     _permissionMode,
                     _runtime.Session.Messages.Count,
                     _usageTracker.Turns(),
@@ -154,6 +157,21 @@ public class ReplSession
                 await HandleCommitAsync();
                 return new SlashCommandResult(false);
 
+            case SlashCommandKind.Plan:
+                return new SlashCommandResult(false, HandlePlanCommand(command.Args));
+
+            case SlashCommandKind.Branch:
+                await HandleBranchAsync(command.Args);
+                return new SlashCommandResult(false);
+
+            case SlashCommandKind.Worktree:
+                await HandleWorktreeAsync(command.Args);
+                return new SlashCommandResult(false);
+
+            case SlashCommandKind.Pr:
+                await HandlePrAsync(command.Args);
+                return new SlashCommandResult(false);
+
             case SlashCommandKind.Init:
                 Console.WriteLine(ConsoleUi.MessageBlock("init", "Init from inside REPL is not implemented yet."));
                 return new SlashCommandResult(false);
@@ -189,7 +207,7 @@ public class ReplSession
             }
 
             case SlashCommandKind.Memory:
-                Console.WriteLine(ConsoleUi.MessageBlock("memory", "Memory inspection is not implemented yet."));
+                HandleMemoryCommand(command.Args);
                 return new SlashCommandResult(false);
 
             case SlashCommandKind.Agents:
@@ -242,7 +260,7 @@ public class ReplSession
         catch (InvalidOperationException ex)
         {
             Console.WriteLine(ConsoleUi.ErrorBlock(ex.Message));
-            return $"Thinking with {_provider} · {_model}";
+            return BuildBusyLabel();
         }
 
         var newClient = ProviderClient.FromProvider(providerKind, apiKey);
@@ -251,13 +269,74 @@ public class ReplSession
         _model = resolvedModel;
         _provider = FormatProvider(providerKind);
 
-        var busyLabel = $"Thinking with {_provider} · {_model}";
         Console.WriteLine(ConsoleUi.MessageBlock(
             "model",
             $"Switched to {_model}",
             $"Provider: {_provider}"
         ));
-        return busyLabel;
+        return BuildBusyLabel();
+    }
+
+    private string HandlePlanCommand(string? args)
+    {
+        var action = args?.Trim();
+        if (string.IsNullOrWhiteSpace(action))
+        {
+            _runtime.Mode = AgentExecutionMode.Planning;
+            _runtime.PlanningDepth = null;
+            Console.WriteLine(ConsoleUi.MessageBlock(
+                "plan",
+                "Planning mode enabled.\nThe assistant may inspect the workspace and produce a plan, but it cannot edit files or run mutating tools.",
+                "Use /plan deep for a more exhaustive plan, /plan approve to switch back to execute mode, or /plan exit to leave planning mode."
+            ));
+            return BuildBusyLabel();
+        }
+
+        switch (action.ToLowerInvariant())
+        {
+            case "deep":
+                _runtime.Mode = AgentExecutionMode.Planning;
+                _runtime.PlanningDepth = "deep";
+                Console.WriteLine(ConsoleUi.MessageBlock(
+                    "plan",
+                    "Deep planning mode enabled.\nThe assistant should inspect more broadly, compare alternatives, and produce a more detailed execution plan.",
+                    "Use /plan approve to switch back to execute mode when the plan looks right."
+                ));
+                return BuildBusyLabel();
+            case "approve":
+                _runtime.Mode = AgentExecutionMode.Execute;
+                _runtime.PlanningDepth = null;
+                Console.WriteLine(ConsoleUi.MessageBlock(
+                    "plan",
+                    "Planning approved.\nSwitched back to execute mode.",
+                    "Your next request can implement the approved plan."
+                ));
+                return BuildBusyLabel();
+            case "exit":
+            case "off":
+                _runtime.Mode = AgentExecutionMode.Execute;
+                _runtime.PlanningDepth = null;
+                Console.WriteLine(ConsoleUi.MessageBlock(
+                    "plan",
+                    "Planning mode disabled.\nSwitched back to execute mode."
+                ));
+                return BuildBusyLabel();
+            case "status":
+                Console.WriteLine(ConsoleUi.MessageBlock(
+                    "plan",
+                    $"Current mode: {_runtime.Mode.AsString()}",
+                    _runtime.Mode == AgentExecutionMode.Planning && string.Equals(_runtime.PlanningDepth, "deep", StringComparison.OrdinalIgnoreCase)
+                        ? "Depth: deep"
+                        : null
+                ));
+                return BuildBusyLabel();
+            default:
+                Console.WriteLine(ConsoleUi.MessageBlock(
+                    "plan",
+                    "Usage:\n/plan\n/plan deep\n/plan approve\n/plan exit\n/plan status"
+                ));
+                return BuildBusyLabel();
+        }
     }
 
     private string ApplyGlobalSettingsToCurrentSession(GlobalSettings settings)
@@ -281,7 +360,13 @@ public class ReplSession
         _model = effectiveModel;
         _provider = FormatProvider(effectiveProvider);
 
-        return $"Thinking with {_provider} · {_model}";
+        return BuildBusyLabel();
+    }
+
+    private string BuildBusyLabel()
+    {
+        var prefix = _runtime.Mode == AgentExecutionMode.Planning ? "Planning" : "Thinking";
+        return $"{prefix} with {_provider} · {_model}";
     }
 
     private static string FormatProvider(ProviderKind provider) => provider switch
@@ -617,6 +702,225 @@ public class ReplSession
             Console.WriteLine(ConsoleUi.MessageBlock("commit", commitOutput.Trim()));
     }
 
+    // ── /branch ─────────────────────────────────────────────────────────────────
+
+    private async Task HandleBranchAsync(string? args)
+    {
+        var trimmed = args?.Trim();
+
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            var (output, _) = await RunGitAsync("branch", "--list", "--sort=-committerdate");
+            if (string.IsNullOrWhiteSpace(output))
+            {
+                Console.WriteLine(ConsoleUi.MessageBlock("branch", "No branches found."));
+                return;
+            }
+
+            var lines = output.Trim().Split('\n').Select(l => l.TrimEnd()).ToList();
+            Console.WriteLine(ConsoleUi.MessageBlock("branch", lines, "Use /branch <name> to create and switch."));
+            return;
+        }
+
+        var parts = trimmed.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
+        if (parts[0].Equals("checkout", StringComparison.OrdinalIgnoreCase) && parts.Length == 2)
+        {
+            var (output, exitCode) = await RunGitAsync("switch", parts[1]);
+            Console.WriteLine(exitCode == 0
+                ? ConsoleUi.MessageBlock("branch", $"Switched to branch '{parts[1]}'.")
+                : ConsoleUi.ErrorBlock($"git switch failed:\n{output.Trim()}"));
+            return;
+        }
+
+        var branchName = trimmed;
+        Console.Error.Write($"{ConsoleUi.Warning("?")} Create and switch to new branch '{branchName}'? {ConsoleUi.Muted("(y/n)")} ");
+        var confirm = Console.ReadKey(intercept: true);
+        Console.Error.WriteLine();
+        if (confirm.Key != ConsoleKey.Y)
+        {
+            Console.WriteLine(ConsoleUi.MessageBlock("branch", "Aborted."));
+            return;
+        }
+
+        var (createOutput, createExit) = await RunGitAsync("switch", "-c", branchName);
+        Console.WriteLine(createExit == 0
+            ? ConsoleUi.MessageBlock("branch", $"Created and switched to branch '{branchName}'.")
+            : ConsoleUi.ErrorBlock($"git switch -c failed:\n{createOutput.Trim()}"));
+    }
+
+    // ── /worktree ────────────────────────────────────────────────────────────────
+
+    private async Task HandleWorktreeAsync(string? args)
+    {
+        var trimmed = args?.Trim();
+
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            var (output, _) = await RunGitAsync("worktree", "list");
+            Console.WriteLine(ConsoleUi.MessageBlock("worktree", string.IsNullOrWhiteSpace(output) ? "No worktrees." : output.Trim(),
+                "Use /worktree add <path> [branch] or /worktree remove <path>."));
+            return;
+        }
+
+        var parts = trimmed.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2)
+        {
+            Console.WriteLine(ConsoleUi.MessageBlock("worktree", "Usage:\n/worktree\n/worktree add <path> [branch]\n/worktree remove <path>"));
+            return;
+        }
+
+        switch (parts[0].ToLowerInvariant())
+        {
+            case "add":
+            {
+                var wtArgs = parts.Length == 3
+                    ? new[] { "worktree", "add", parts[1], "-b", parts[2] }
+                    : new[] { "worktree", "add", parts[1] };
+                var (output, exitCode) = await RunGitAsync(wtArgs);
+                Console.WriteLine(exitCode == 0
+                    ? ConsoleUi.MessageBlock("worktree", $"Worktree created at '{parts[1]}'.\n{output.Trim()}")
+                    : ConsoleUi.ErrorBlock($"git worktree add failed:\n{output.Trim()}"));
+                break;
+            }
+            case "remove":
+            {
+                var (output, exitCode) = await RunGitAsync("worktree", "remove", parts[1]);
+                Console.WriteLine(exitCode == 0
+                    ? ConsoleUi.MessageBlock("worktree", $"Worktree '{parts[1]}' removed.")
+                    : ConsoleUi.ErrorBlock($"git worktree remove failed:\n{output.Trim()}"));
+                break;
+            }
+            default:
+                Console.WriteLine(ConsoleUi.MessageBlock("worktree", "Unknown subcommand. Use: add, remove, or no args to list."));
+                break;
+        }
+    }
+
+    // ── /pr ─────────────────────────────────────────────────────────────────────
+
+    private async Task HandlePrAsync(string? args)
+    {
+        var ghCheck = await RunCommandAsync("gh", ["--version"]);
+        if (ghCheck.ExitCode != 0)
+        {
+            Console.WriteLine(ConsoleUi.ErrorBlock("GitHub CLI (gh) is not available. Install it from https://cli.github.com/"));
+            return;
+        }
+
+        var (log, _) = await RunGitAsync("log", "origin/HEAD..HEAD", "--oneline", "--no-decorate");
+        var (diff, _) = await RunGitAsync("diff", "origin/HEAD..HEAD");
+
+        if (string.IsNullOrWhiteSpace(log) && string.IsNullOrWhiteSpace(diff))
+        {
+            Console.WriteLine(ConsoleUi.MessageBlock("pr", "No commits ahead of origin/HEAD. Nothing to open a PR for."));
+            return;
+        }
+
+        Console.WriteLine(ConsoleUi.Muted("  Generating PR title and body…"));
+
+        var prPrompt =
+            "Based on the following git commits and diff, write a GitHub pull request title and body. " +
+            "Output ONLY valid JSON in this format: {\"title\": \"...\", \"body\": \"...\"}. " +
+            "Title must be under 70 characters. Body should be markdown with ## Summary, ## Test plan sections. " +
+            "No preamble, no explanation, no extra text.\n\n" +
+            $"Commits:\n{log}\n\nDiff (first 3000 chars):\n{diff[..Math.Min(diff.Length, 3000)]}";
+
+        var savedMessages = _runtime.Session.Messages.ToList();
+        _runtime.Session.Clear();
+        string prTitle, prBody;
+        try
+        {
+            var result = await _runtime.RunTurnAsync(prPrompt);
+            var rawJson = ExtractText(result).Trim();
+            using var doc = JsonDocument.Parse(rawJson);
+            prTitle = doc.RootElement.GetProperty("title").GetString() ?? "chore: update";
+            prBody = doc.RootElement.GetProperty("body").GetString() ?? string.Empty;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(ConsoleUi.ErrorBlock($"Failed to generate PR content.\n{ex.Message}"));
+            return;
+        }
+        finally
+        {
+            _runtime.Session.Clear();
+            foreach (var m in savedMessages) _runtime.Session.AddMessage(m);
+        }
+
+        Console.WriteLine(ConsoleUi.MessageBlock("pr preview", $"**{prTitle}**\n\n{prBody}"));
+        Console.Error.Write($"{ConsoleUi.Warning("?")} Open PR with this title and body? {ConsoleUi.Muted("(y/n)")} ");
+        var confirm = Console.ReadKey(intercept: true);
+        Console.Error.WriteLine();
+        if (confirm.Key != ConsoleKey.Y)
+        {
+            Console.WriteLine(ConsoleUi.MessageBlock("pr", "Aborted."));
+            return;
+        }
+
+        var ghResult = await RunCommandAsync("gh", ["pr", "create", "--title", prTitle, "--body", prBody]);
+        if (ghResult.ExitCode != 0)
+            Console.WriteLine(ConsoleUi.ErrorBlock($"gh pr create failed:\n{ghResult.Output.Trim()}"));
+        else
+            Console.WriteLine(ConsoleUi.MessageBlock("pr", ghResult.Output.Trim()));
+    }
+
+    // ── /memory ─────────────────────────────────────────────────────────────────
+
+    private void HandleMemoryCommand(string? args)
+    {
+        var cwd = Directory.GetCurrentDirectory();
+        var memoryDir = Path.Combine(cwd, ".codesharp", "memory");
+        var memoryIndex = Path.Combine(cwd, ".codesharp", "MEMORY.md");
+
+        var trimmed = args?.Trim();
+
+        if (!string.IsNullOrWhiteSpace(trimmed))
+        {
+            var target = Path.Combine(memoryDir, trimmed.EndsWith(".md") ? trimmed : trimmed + ".md");
+            if (!File.Exists(target))
+            {
+                Console.WriteLine(ConsoleUi.ErrorBlock($"Memory file not found: {trimmed}"));
+                return;
+            }
+
+            var content = File.ReadAllText(target).Trim();
+            Console.WriteLine(ConsoleUi.MessageBlock($"memory · {Path.GetFileNameWithoutExtension(target)}", content));
+            return;
+        }
+
+        var lines = new List<string>();
+
+        if (File.Exists(memoryIndex))
+        {
+            lines.Add("Index: .codesharp/MEMORY.md");
+            lines.Add(string.Empty);
+        }
+
+        if (Directory.Exists(memoryDir))
+        {
+            var files = Directory.EnumerateFiles(memoryDir, "*.md").OrderBy(f => f).ToList();
+            if (files.Count > 0)
+            {
+                lines.Add($"{files.Count} memory file{(files.Count == 1 ? string.Empty : "s")}:");
+                foreach (var f in files)
+                {
+                    lines.Add($"  {Path.GetFileNameWithoutExtension(f)}");
+                }
+            }
+            else
+            {
+                lines.Add("No memory files in .codesharp/memory/");
+            }
+        }
+        else
+        {
+            lines.Add("No .codesharp/memory/ directory found.");
+        }
+
+        Console.WriteLine(ConsoleUi.MessageBlock("memory", lines,
+            "Use /memory <filename> to view a specific memory. Edit .codesharp/memory/*.md to add memories."));
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────────
 
     private static string ExtractText(TurnSummary summary) =>
@@ -641,13 +945,16 @@ public class ReplSession
         return sb.ToString();
     }
 
-    private static async Task<(string Output, int ExitCode)> RunGitAsync(params string[] arguments)
+    private static Task<(string Output, int ExitCode)> RunGitAsync(params string[] arguments) =>
+        RunCommandAsync("git", arguments);
+
+    private static async Task<(string Output, int ExitCode)> RunCommandAsync(string fileName, IEnumerable<string> arguments)
     {
         try
         {
             var psi = new ProcessStartInfo
             {
-                FileName = "git",
+                FileName = fileName,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
