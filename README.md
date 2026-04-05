@@ -1,6 +1,6 @@
 # CodeSharp
 
-CodeSharp is a terminal-first coding assistant for .NET developers who want fast answers, clean repo navigation, and a CLI that feels built for real work instead of demos.
+CodeSharp is a terminal-first coding assistant for developers who want fast answers, clean repo navigation, and a CLI that feels built for real work instead of demos.
 
 Built as a modern C#/.NET 10 take on the original Claw Code, it brings Anthropic, NVIDIA, OpenAI, and xAI models into a sharper REPL with live streaming, readable markdown rendering, colored diff previews, clearer tool feedback, and smoother code-reading and editing workflows.
 
