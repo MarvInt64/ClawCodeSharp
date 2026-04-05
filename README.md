@@ -61,6 +61,26 @@ Single prompt:
 dotnet run --project src/CodeSharp.Cli -- "Explain this codebase"
 ```
 
+### Build a Standalone Binary
+
+For a single self-contained binary on macOS Apple Silicon:
+
+```bash
+dotnet publish src/CodeSharp.Cli/CodeSharp.Cli.csproj \
+  -c Release \
+  -r osx-arm64 \
+  --self-contained true \
+  /p:PublishSingleFile=true
+```
+
+The published binary will be written to:
+
+```text
+src/CodeSharp.Cli/bin/Release/net10.0/osx-arm64/publish/
+```
+
+For Intel macOS, Linux, and Windows examples, see [Standalone Binary](#standalone-binary) below.
+
 ## Showcase
 
 <p>
