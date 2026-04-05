@@ -13,25 +13,46 @@ It also adds practical features that matter in daily use: slash-command suggesti
   <img src="assets/showcase/screen1.png" alt="CodeSharp REPL screenshot 2" width="49%" />
 </p>
 
-## Improvements
+## Features
 
-The current C# CLI has already been improved in several practical areas:
+### Agent & Planning
+- **Planning mode** — the model can call `EnterPlanMode` and `ExitPlanMode` itself, or you can use `/plan` and `/plan approve`. In planning mode all mutating tools are blocked; the assistant produces a structured plan with Goal, Assumptions, Steps, Risks, and Validation sections.
+- **Agent tool with subagent types** — `Agent` now spawns an isolated `ConversationRuntime` per call. `subagent_type: "Explore"` maps to a read-only analysis agent, `"Plan"` runs in planning mode, and the default runs a focused task agent. Each has its own session and type-specific system prompt.
+- **Automatic verification** — after file edits the runtime detects the build system (dotnet, pnpm/npm typecheck, python -m py_compile) and runs it automatically, feeding the result back to the model as a system note.
 
-- Assistant responses are no longer dumped as raw markdown. The CLI now renders headings, lists, quotes, inline code, links, fenced code blocks, tables, and horizontal rules in a terminal-friendly format.
-- Long assistant output and status lines wrap to the current console width instead of overflowing awkwardly.
-- Fenced `diff` and `patch` blocks are easier to read, and file edits can surface a colored inline diff preview with green additions and red removals.
-- The REPL uses a clearer full-screen layout: the banner stays pinned at the top, while the working area below shows the latest user input, assistant plans, tool activity, and prompt state.
-- Busy-state feedback is much clearer. The spinner sits near the prompt, queued follow-up prompts are visible, and empty waiting phases are labeled instead of feeling like a hang.
-- Interrupt handling is more usable: `Ctrl+C` cancels the active turn first, and repeated interrupt handling supports a cleaner exit flow.
-- Internal activity messages are cleaner. Tool calls such as plan updates are shown as short human-readable status lines instead of raw JSON payloads like `TodoWrite {...}`.
-- The assistant now says what it is about to inspect, search, or change before using tools, and that intent is highlighted clearly in the REPL.
-- Assistant text now streams into the UI while the model is still thinking, which reduces the dead time between tool calls and the next visible step.
-- Slash commands now have live suggestions while typing. Typing `/` immediately shows matching commands and narrows them as you continue typing.
-- Global provider, model, and API key defaults can be stored in `~/.codesharp/settings.json`, with an interactive config flow in the CLI.
-- The config menu itself is more guided: it keeps the header visible and supports arrow-key navigation for provider, model, and API key management.
-- Read-only repo analysis is faster because `read_file`, `glob_search`, and `grep_search` can run in parallel within the same assistant step.
-- Repository search is more reliable: `glob_search` and `grep_search` return counts plus capped samples instead of only raw lists, respect the root `.gitignore`, and skip noisy folders like `.git`, `bin`, `obj`, `.idea`, and `node_modules`.
-- Broad negative claims are handled more carefully: the runtime and prompt now push the model to verify search results before saying something does not exist in the codebase.
+### Git Workflow
+- `/commit` — AI-generates a conventional commit message from staged changes, shows a preview, and commits on confirmation.
+- `/diff` — shows `git diff --stat` plus a colored inline diff with green additions and red removals, truncated at 200 lines.
+- `/branch` — list branches, create and switch with `/branch <name>`, or checkout an existing one with `/branch checkout <name>`.
+- `/worktree` — list, add, and remove git worktrees directly from the REPL.
+- `/pr` — generates a PR title and body with the model, previews them, and calls `gh pr create` on confirmation.
+
+### Memory & Context
+- **Auto-loaded memory** — `CODESHARP.md`, `.codesharp/MEMORY.md`, and all `.codesharp/memory/*.md` files are included in the system prompt automatically at session start.
+- `/memory` — lists memory files; `/memory <name>` shows the content of a specific file. Edit files in `.codesharp/memory/` to persist facts across sessions.
+- **Session compaction** — `/compact` summarizes old messages via the model and rebuilds the session history to stay within context limits while preserving recent turns.
+
+### Search & Navigation
+- **Parallel read-only analysis** — `read_file`, `glob_search`, `grep_search`, `find_symbol`, `find_references`, and task tools run in parallel within a single assistant step.
+- **Symbol and reference search** — `find_symbol` and `find_references` cover C#, TypeScript, Python, C/C++, and HTML across the whole workspace without a language server.
+- `/symbols <name>` and `/refs <name>` — symbol and reference search directly from the REPL with formatted output.
+- **Gitignore-aware search** — `glob_search` and `grep_search` respect `.gitignore` and skip `bin`, `obj`, `.git`, `node_modules`, and similar noise folders.
+
+### REPL Experience
+- **Live streaming** — assistant text streams into the UI while the model is still thinking, reducing dead time between tool calls.
+- **Slash command suggestions** — typing `/` shows live-narrowing command completions.
+- **Colored diff previews** — file edits show a green/red inline diff inline in the activity log.
+- **Queued prompts** — type while the model is thinking; the next prompt is queued and sent automatically when the current turn finishes.
+- **Interrupt flow** — `Ctrl+C` cancels the active turn first; a second interrupt exits.
+- **Session export** — `/export [path]` saves the full session transcript as a markdown file.
+
+### System Prompt (aligned with Claude Code)
+The system prompt now follows the same structure as Claude Code's leaked guidelines:
+- **Doing tasks** — no scope creep, no added comments on untouched code, no speculative abstractions, no error handling for impossible cases.
+- **Output style** — lead with the answer, not the reasoning; no filler; file references use `path:line` format.
+- **Git workflow** — conventional commits, no force-push to main, PR format.
+- **Planning mode** — when to use `EnterPlanMode`, what to produce, when to exit.
+- **Security** — no command injection, XSS, SQL injection, or path traversal; validate only at system boundaries.
 
 
 ## Project Structure
@@ -144,9 +165,13 @@ CodeSharp now uses a few distinct config and state files. They serve different p
 - `~/.codesharp/settings.json`
   Global defaults for the CLI. This is where `codesharp config` stores your preferred provider, model, and provider-specific API keys.
 - `./.codesharp/settings.json`
-  Project-local config created by `codesharp init`. This is the repo-local config file CodeSharp looks for in the current workspace, including plugin/config loading for that repo.
+  Project-local config created by `codesharp init`. Repo-local settings including plugin config.
 - `./CODESHARP.md`
-  Project instructions for the agent. If present, its contents are included in the generated system prompt so you can define coding conventions, repo context, or workflow notes.
+  Project instructions for the agent. Included in the system prompt at session start. Define coding conventions, repo context, or workflow notes here.
+- `./.codesharp/MEMORY.md`
+  Memory index. Each line should be a pointer to a memory file. Included in the system prompt automatically.
+- `./.codesharp/memory/*.md`
+  Individual memory files (user, feedback, project, reference types). All `.md` files in this folder are loaded into the system prompt at session start. Use `/memory` in the REPL to browse them.
 - `./.codesharp/sessions/session-*.json`
   Saved conversation/session files for prompt and REPL runs.
 - `./.codesharp-todos.json`
@@ -209,3 +234,34 @@ codesharp config unset model
 | `--output` | Output format: text, json |
 | `--version` | Show version |
 | `--help` | Show help |
+
+## Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show all commands |
+| `/status` | Model, mode, permissions, token usage, git branch |
+| `/model [name]` | Show or switch the active model mid-session |
+| `/permissions [mode]` | Show or switch permission mode |
+| `/plan` | Enter planning mode (blocks all mutating tools) |
+| `/plan deep` | Enter deep planning mode |
+| `/plan approve` | Approve plan and return to execute mode |
+| `/plan exit` | Exit planning mode without approving |
+| `/compact` | Summarize old messages to reduce context size |
+| `/diff` | Show git status and colored diff |
+| `/commit` | AI-generate a commit message and commit |
+| `/branch [name]` | List branches or create and switch to a new one |
+| `/branch checkout <name>` | Switch to an existing branch |
+| `/worktree` | List git worktrees |
+| `/worktree add <path> [branch]` | Create a new worktree |
+| `/worktree remove <path>` | Remove a worktree |
+| `/pr` | Generate a PR title/body and open via `gh pr create` |
+| `/symbols <name>` | Find symbol declarations across the workspace |
+| `/refs <name>` | Find symbol references across the workspace |
+| `/memory` | List memory files in `.codesharp/memory/` |
+| `/memory <name>` | Show the content of a specific memory file |
+| `/cost` | Show token usage and estimated cost breakdown |
+| `/export [path]` | Save session transcript as markdown |
+| `/clear --confirm` | Clear session history |
+| `/config` | Interactive config menu |
+| `/version` | Show version |
