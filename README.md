@@ -9,8 +9,8 @@ It also adds practical features that matter in daily use: slash-command suggesti
 ## Showcase
 
 <p>
-  <img src="assets/showcase/screen0.png" alt="CodeSharp REPL screenshot 1" width="49%" />
-  <img src="assets/showcase/screen1.png" alt="CodeSharp REPL screenshot 2" width="49%" />
+  <img src="assets/showcase/screen0.jpg" alt="CodeSharp REPL screenshot 1" width="49%" />
+  <img src="assets/showcase/screen1.jpg" alt="CodeSharp REPL screenshot 2" width="49%" />
 </p>
 
 ## Features

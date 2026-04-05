@@ -490,6 +490,56 @@ version = "0.1.0"
     }
 
     [Fact]
+    public async Task RunTurnAsync_PreservesNewlinesInAssistantDraftStream()
+    {
+        var api = new FakeApiClient(
+            new[]
+            {
+                new AssistantEvent[]
+                {
+                    new AssistantEvent.TextDelta("# Title\n"),
+                    new AssistantEvent.TextDelta("- first item\n"),
+                    new AssistantEvent.TextDelta("- second item"),
+                    new AssistantEvent.MessageStop()
+                }
+            });
+
+        var runtime = new ConversationRuntime(
+            Session.New(),
+            api,
+            new FakeToolExecutor(),
+            new PermissionPolicy(PermissionMode.DangerFullAccess, new Dictionary<string, PermissionMode>()),
+            ["You are CodeSharp."],
+            PermissionMode.DangerFullAccess,
+            AutoVerifyMode.Off
+        );
+
+        var activities = new List<RuntimeActivity>();
+        await runtime.RunTurnAsync("respond in markdown", activitySink: activities.Add);
+
+        var finalDraft = activities.OfType<RuntimeActivity.AssistantDraft>().Last();
+        Assert.Contains('\n', finalDraft.Text);
+        Assert.Contains("- first item", finalDraft.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void FormatActivityLines_RendersAssistantDraftMarkdownDuringStreaming()
+    {
+        var lines = Program.FormatActivityLines(
+            new ActivityLine(
+                "assistant-draft",
+                "assistant_draft",
+                "# Title\n\n- first item\n- second item",
+                ActivityLineStatus.Info,
+                DetailLines: Program.RenderAssistantDraftPreviewLines("# Title\n\n- first item\n- second item")));
+
+        Assert.True(lines.Count >= 3);
+        Assert.Contains(lines, line => line.Contains("drafting response", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(lines, line => line.Contains("Title", StringComparison.Ordinal));
+        Assert.Contains(lines, line => line.Contains("first item", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task EditFile_ReturnsDiffCountsAndHeadTailPreview()
     {
         var workspace = Path.Combine(Path.GetTempPath(), $"codesharp-tests-{Guid.NewGuid():N}");

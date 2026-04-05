@@ -794,7 +794,7 @@ End by clearly indicating that you are waiting for approval before implementatio
 
     private static string? NormalizeAssistantLiveText(string text)
     {
-        var normalized = text.Replace("\r\n", " ").Replace('\n', ' ').Trim();
+        var normalized = text.Replace("\r\n", "\n").TrimEnd();
         return string.IsNullOrWhiteSpace(normalized) ? null : normalized;
     }
 

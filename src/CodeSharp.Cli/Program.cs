@@ -199,7 +199,12 @@ internal sealed class TurnActivityState
                 return;
             }
 
-            _lines[i] = _lines[i] with { Description = text, Status = ActivityLineStatus.Info };
+            _lines[i] = _lines[i] with
+            {
+                Description = text,
+                Status = ActivityLineStatus.Info,
+                DetailLines = Program.RenderAssistantDraftPreviewLines(text)
+            };
             return;
         }
 
@@ -207,7 +212,8 @@ internal sealed class TurnActivityState
             "assistant-draft",
             "assistant_draft",
             text,
-            ActivityLineStatus.Info
+            ActivityLineStatus.Info,
+            DetailLines: Program.RenderAssistantDraftPreviewLines(text)
         ));
     }
 
@@ -884,6 +890,11 @@ Add any additional context about the project.
 
     internal static IReadOnlyList<string> FormatActivityLines(ActivityLine line)
     {
+        if (line.ToolName == "assistant_draft")
+        {
+            return FormatAssistantDraftActivityLines(line);
+        }
+
         var lines = new List<string>
         {
             line.Status switch
@@ -904,6 +915,34 @@ Add any additional context about the project.
 
         return lines;
     }
+
+    internal static IReadOnlyList<string> RenderAssistantDraftPreviewLines(string text)
+    {
+        var normalized = string.IsNullOrWhiteSpace(text)
+            ? string.Empty
+            : text.Replace("\r\n", "\n").TrimEnd();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return [];
+        }
+
+        return TerminalMarkdown.Render(normalized, Math.Max(24, ConsoleUi.ContentWidth() - 6));
+    }
+
+    private static IReadOnlyList<string> FormatAssistantDraftActivityLines(ActivityLine line)
+    {
+        var rendered = line.DetailLines ?? RenderAssistantDraftPreviewLines(line.Description);
+        if (rendered.Count == 0)
+        {
+            return [$"{ConsoleUi.Muted("⋯")} {ConsoleUi.Muted("drafting response...")}"];
+        }
+
+        var lines = new List<string> { $"{ConsoleUi.Muted("⋯")} {ConsoleUi.Muted("drafting response...")}" };
+        lines.AddRange(rendered.Select(FormatAssistantDraftDetailLine));
+        return lines;
+    }
+
+    private static string FormatAssistantDraftDetailLine(string line) => $"    {line}";
 
     private static string FormatActivityDetailLine(string line)
     {
