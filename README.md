@@ -6,6 +6,61 @@ Built as a modern C#/.NET 10 take on the original Claw Code, it brings Anthropic
 
 It also adds practical features that matter in daily use: slash-command suggestions, guided config management, pinned full-screen REPL layout, parallel read-only repo analysis, smarter search output with context, and better handling for queued prompts, retries, and interrupt flow.
 
+## Getting Started
+
+Requirements:
+- .NET 10 SDK
+
+`global.json` currently pins SDK `10.0.100` with `rollForward: latestFeature`.
+
+### Install .NET 10 SDK
+
+#### macOS (Homebrew)
+
+```bash
+brew install --cask dotnet-sdk
+dotnet --list-sdks
+```
+
+If `dotnet` is not on your `PATH` afterwards, add the default install location for your shell:
+
+```bash
+export PATH="/usr/local/share/dotnet:$PATH"
+```
+
+On Apple Silicon machines installed via Microsoft's pkg installer, you may instead need:
+
+```bash
+export PATH="/opt/homebrew/share/dotnet:$PATH"
+```
+
+#### Linux / Windows
+
+Install the .NET 10 SDK from the official Microsoft instructions:
+- https://learn.microsoft.com/dotnet/core/install/linux
+- https://learn.microsoft.com/dotnet/core/install/windows
+
+### Build
+
+```bash
+dotnet restore CodeSharp.sln
+dotnet build CodeSharp.sln
+```
+
+### Run
+
+Interactive REPL:
+
+```bash
+dotnet run --project src/CodeSharp.Cli
+```
+
+Single prompt:
+
+```bash
+dotnet run --project src/CodeSharp.Cli -- "Explain this codebase"
+```
+
 ## Showcase
 
 <p>
@@ -70,19 +125,7 @@ src/
 └── CodeSharp.Server/                # HTTP server for sessions
 ```
 
-## Build
-
-Requirements:
-- .NET 10 SDK
-
-`global.json` currently pins SDK `10.0.100`.
-
-```bash
-dotnet restore CodeSharp.sln
-dotnet build CodeSharp.sln
-```
-
-## Run
+## Build & Run Details
 
 ### Interactive REPL Mode
 
